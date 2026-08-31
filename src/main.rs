@@ -1,37 +1,35 @@
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread;
 use id3::TagLike;
 
 const USAGE: &str = "\
-dj-music-suite - batch convert .ncm files via ncmc
+dj-music-suite - batch convert .ncm files and embed cover art + lyrics
 
-Usage: dj-music-suite --input <DIR> --output <DIR> [--threads <N>] [--ncmc <PATH>]
+Usage: dj-music-suite --input <DIR> --output <DIR> [--threads <N>]
                       [--meta-dir <DIR>] [--no-download]
 
 Options:
     --input <DIR>     folder containing .ncm files
     --output <DIR>    folder to write converted audio files to
     --threads <N>     number of parallel conversions (default: 8)
-    --ncmc <PATH>     path to the ncmc binary (default: auto-detect)
     --meta-dir <DIR>  folder with track-<musicId>.jpg covers (default: <input>/meta)
     --no-download     never fetch missing covers from the albumPic URL
     -h, --help        print this help
 
+Decryption is built in (ncm_core), no external binaries are needed.
 Converted files are tagged automatically when possible: the cover comes from
-<meta-dir>/track-<musicId>.jpg (falling back to the albumPic URL stored in
-the .ncm metadata unless --no-download) and a same-named .lrc file is
-embedded as unsynced lyrics (USLT).";
+<meta-dir>/track-<musicId>.jpg, then the image embedded in the .ncm file, then
+the albumPic URL (unless --no-download); a same-named .lrc file is embedded
+as unsynced lyrics (USLT).";
 
 struct Args {
     input: PathBuf,
     output: PathBuf,
     threads: usize,
-    ncmc: Option<PathBuf>,
     meta_dir: Option<PathBuf>,
     no_download: bool,
 }
@@ -40,7 +38,6 @@ fn parse_args() -> Result<Args, String> {
     let mut input = None;
     let mut output = None;
     let mut threads = 8;
-    let mut ncmc = None;
     let mut meta_dir = None;
     let mut no_download = false;
     let mut iter = env::args().skip(1);
@@ -63,9 +60,6 @@ fn parse_args() -> Result<Args, String> {
                     return Err("--threads must be at least 1".into());
                 }
             }
-            "--ncmc" => {
-                ncmc = Some(iter.next().ok_or("--ncmc requires a value")?);
-            }
             "--meta-dir" => {
                 meta_dir = Some(iter.next().ok_or("--meta-dir requires a value")?);
             }
@@ -79,74 +73,9 @@ fn parse_args() -> Result<Args, String> {
         input: PathBuf::from(input.ok_or("--input is required (e.g. --input test)")?),
         output: PathBuf::from(output.ok_or("--output is required (e.g. --output test-mp3)")?),
         threads,
-        ncmc: ncmc.map(PathBuf::from),
         meta_dir: meta_dir.map(PathBuf::from),
         no_download,
     })
-}
-
-fn ncmc_candidates() -> Vec<String> {
-    let os = match env::consts::OS {
-        "macos" => "darwin",
-        "linux" => "linux",
-        "windows" => "win32",
-        other => other,
-    };
-    let arch = match env::consts::ARCH {
-        "x86_64" => "x64",
-        "aarch64" => "arm64",
-        other => other,
-    };
-    let ext = if env::consts::OS == "windows" { ".exe" } else { "" };
-    let name = format!("ncmc-{os}-{arch}{ext}");
-    let mut dirs = Vec::new();
-    if let Ok(exe) = env::current_exe() {
-        if let Some(d) = exe.parent() {
-            dirs.push(d.to_path_buf());
-            dirs.push(d.join("bin"));
-        }
-    }
-    if let Ok(cwd) = env::current_dir() {
-        dirs.push(cwd.join("bin"));
-        dirs.push(cwd);
-    }
-    dirs.into_iter()
-        .map(|d| d.join(&name))
-        .map(|p| p.to_string_lossy().into_owned())
-        .collect()
-}
-
-fn find_ncmc(explicit: Option<&Path>) -> Result<PathBuf, String> {
-    if let Some(p) = explicit {
-        if p.is_file() {
-            return Ok(p.to_path_buf());
-        }
-        return Err(format!("ncmc binary not found at {}", p.display()));
-    }
-    for candidate in ncmc_candidates() {
-        let p = Path::new(&candidate);
-        if p.is_file() {
-            return Ok(p.to_path_buf());
-        }
-    }
-    if let Ok(path_var) = env::var("PATH") {
-        for dir in env::split_paths(&path_var) {
-            for candidate in ncmc_candidates() {
-                let p = dir.join(&candidate);
-                if p.is_file() {
-                    return Ok(p);
-                }
-            }
-            let bare = dir.join("ncmc");
-            if bare.is_file() {
-                return Ok(bare);
-            }
-        }
-    }
-    Err(format!(
-        "could not locate ncmc, looked at: {}\nuse --ncmc <PATH> to point at a ncmc binary",
-        ncmc_candidates().join(", ")
-    ))
 }
 
 fn is_ncm(p: &Path) -> bool {
@@ -172,100 +101,13 @@ fn collect_ncm_files(dir: &Path) -> Result<Vec<PathBuf>, String> {
     Ok(files)
 }
 
-fn find_produced(out_dir: &Path, stem: &str) -> Option<PathBuf> {
-    fs::read_dir(out_dir).ok()?.flatten().map(|e| e.path()).find(|p| {
-        p.is_file()
-            && p.file_stem().and_then(|s| s.to_str()) == Some(stem)
-            && !is_ncm(p)
-    })
-}
-
-const NCM_MAGIC: &[u8; 8] = b"CTENFDAM";
-const NCM_META_KEY: [u8; 16] = *b"#14ljk_!\\]&0U<'(";
-
 struct NcmMeta {
     music_id: String,
     album_pic: String,
 }
 
-fn le_u32(buf: &[u8], pos: usize) -> Option<(u32, usize)> {
-    let end = pos.checked_add(4)?;
-    if end > buf.len() {
-        return None;
-    }
-    let mut b = [0u8; 4];
-    b.copy_from_slice(&buf[pos..end]);
-    Some((u32::from_le_bytes(b), end))
-}
-
-fn aes128_ecb_decrypt(data: &[u8], key: &[u8; 16]) -> Result<Vec<u8>, String> {
-    use aes::cipher::{generic_array::GenericArray, BlockDecrypt, KeyInit};
-    if data.is_empty() || data.len() % 16 != 0 {
-        return Err("data length is not a multiple of the AES block size".into());
-    }
-    let cipher = aes::Aes128::new(GenericArray::from_slice(key));
-    let mut out = data.to_vec();
-    for chunk in out.chunks_mut(16) {
-        cipher.decrypt_block(GenericArray::from_mut_slice(chunk));
-    }
-    if let Some(&pad) = out.last() {
-        let pad = pad as usize;
-        if (1..=16).contains(&pad)
-            && pad <= out.len()
-            && out[out.len() - pad..].iter().all(|&b| b == pad as u8)
-        {
-            out.truncate(out.len() - pad);
-        }
-    }
-    Ok(out)
-}
-
-fn parse_ncm_meta(path: &Path) -> Result<Option<NcmMeta>, String> {
-    use std::io::Read;
-    let mut file =
-        fs::File::open(path).map_err(|e| format!("cannot open {}: {e}", path.display()))?;
-    let mut head = Vec::new();
-    file.by_ref()
-        .take(256 * 1024)
-        .read_to_end(&mut head)
-        .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
-    if head.len() < 10 || &head[..8] != NCM_MAGIC {
-        return Ok(None);
-    }
-    let mut pos = 10;
-    let (klen, p) = le_u32(&head, pos).ok_or("truncated ncm header")?;
-    pos = p + klen as usize;
-    let (mlen, p) = le_u32(&head, pos).ok_or("truncated ncm header")?;
-    pos = p;
-    if mlen == 0 {
-        return Ok(None);
-    }
-    if pos + mlen as usize > head.len() {
-        return Err("ncm metadata section exceeds the 256 KiB read window".into());
-    }
-    let decoded: Vec<u8> = head[pos..pos + mlen as usize].iter().map(|b| b ^ 0x63).collect();
-    let json_bytes: Vec<u8> = if decoded.starts_with(b"163 key(Don't modify):") {
-        let mut b64 = decoded[22..].to_vec();
-        let rem = b64.len() % 4;
-        if rem > 0 {
-            b64.extend(std::iter::repeat(b'=').take(4 - rem));
-        }
-        use base64::Engine as _;
-        let cipher = base64::engine::general_purpose::STANDARD
-            .decode(&b64)
-            .map_err(|e| format!("ncm metadata base64 decode failed: {e}"))?;
-        let plain = aes128_ecb_decrypt(&cipher, &NCM_META_KEY)?;
-        plain.into_iter().skip(6).collect()
-    } else {
-        decoded
-    };
-    let end = json_bytes
-        .iter()
-        .rposition(|&b| b == b'}')
-        .ok_or("ncm metadata json not found")?
-        + 1;
-    let value: serde_json::Value = serde_json::from_slice(&json_bytes[..end])
-        .map_err(|e| format!("ncm metadata json parse failed: {e}"))?;
+fn parse_meta_json(meta_json: &[u8]) -> Option<NcmMeta> {
+    let value: serde_json::Value = serde_json::from_slice(meta_json).ok()?;
     let music_id = value
         .get("musicId")
         .and_then(|v| v.as_str())
@@ -277,9 +119,9 @@ fn parse_ncm_meta(path: &Path) -> Result<Option<NcmMeta>, String> {
         .unwrap_or_default()
         .to_string();
     if music_id.is_empty() && album_pic.is_empty() {
-        return Ok(None);
+        return None;
     }
-    Ok(Some(NcmMeta { music_id, album_pic }))
+    Some(NcmMeta { music_id, album_pic })
 }
 
 fn format_lrc_time(ms: i64) -> String {
@@ -459,7 +301,13 @@ struct TagCtx {
     allow_download: bool,
 }
 
-fn tag_produced(src: &Path, produced: &Path, ctx: &TagCtx) -> Result<Option<String>, String> {
+fn tag_file(
+    produced: &Path,
+    src: &Path,
+    meta_json: &[u8],
+    embedded_image: Option<ncm_core::image::Image>,
+    ctx: &TagCtx,
+) -> Result<Option<String>, String> {
     let mut lyrics = None;
     let lrc_path = src.with_extension("lrc");
     if lrc_path.is_file() {
@@ -474,30 +322,43 @@ fn tag_produced(src: &Path, produced: &Path, ctx: &TagCtx) -> Result<Option<Stri
         }
     }
 
+    let meta = parse_meta_json(meta_json);
+
     let mut cover_origin: Option<String> = None;
     let mut cover_mime = String::new();
     let mut cover_data: Option<Vec<u8>> = None;
-    if let Some(meta) = parse_ncm_meta(src)? {
-        if let Some(meta_dir) = ctx.meta_dir.as_ref() {
-            if !meta.music_id.is_empty() {
-                for ext in ["jpg", "jpeg", "png", "webp"] {
-                    let p = meta_dir.join(format!("track-{}.{}", meta.music_id, ext));
-                    if p.is_file() {
-                        if let Ok(data) = fs::read(&p) {
-                            cover_mime = sniff_mime(&data).to_string();
-                            cover_origin = Some(format!("local {}", p.display()));
-                            cover_data = Some(data);
-                        }
-                        break;
+    if let (Some(meta_dir), Some(meta)) = (ctx.meta_dir.as_ref(), meta.as_ref()) {
+        if !meta.music_id.is_empty() {
+            for ext in ["jpg", "jpeg", "png", "webp"] {
+                let p = meta_dir.join(format!("track-{}.{}", meta.music_id, ext));
+                if p.is_file() {
+                    if let Ok(data) = fs::read(&p) {
+                        cover_mime = sniff_mime(&data).to_string();
+                        cover_origin = Some(format!("local {}", p.display()));
+                        cover_data = Some(data);
                     }
+                    break;
                 }
             }
         }
-        if cover_data.is_none() && ctx.allow_download && !meta.album_pic.is_empty() {
-            match http_get(&meta.album_pic) {
+    }
+    if cover_data.is_none() {
+        if let Some(image) = embedded_image {
+            cover_mime = image.mime_type().to_string();
+            cover_origin = Some("embedded in ncm".to_string());
+            cover_data = Some(image.into_data());
+        }
+    }
+    if cover_data.is_none() && ctx.allow_download {
+        if let Some(album_pic) = meta
+            .as_ref()
+            .map(|m| m.album_pic.as_str())
+            .filter(|s| !s.is_empty())
+        {
+            match http_get(album_pic) {
                 Ok(data) => {
                     cover_mime = sniff_mime(&data).to_string();
-                    cover_origin = Some(format!("downloaded {}", meta.album_pic));
+                    cover_origin = Some(format!("downloaded {album_pic}"));
                     cover_data = Some(data);
                 }
                 Err(e) => eprintln!("[warn] {}: {e}", src.display()),
@@ -541,54 +402,41 @@ fn tag_produced(src: &Path, produced: &Path, ctx: &TagCtx) -> Result<Option<Stri
     Ok(Some(summary.join(", ")))
 }
 
-fn convert_one(ncmc: &Path, src: &Path, out_dir: &Path) -> Result<PathBuf, String> {
-    let file_name = src
-        .file_name()
-        .ok_or_else(|| format!("bad file name: {}", src.display()))?;
-    let staged = out_dir.join(file_name);
-    fs::copy(src, &staged).map_err(|e| format!("copy into output dir failed: {e}"))?;
-    let result = Command::new(ncmc)
-        .arg(&staged)
-        .output()
-        .map_err(|e| format!("failed to run ncmc: {e}"))
-        .and_then(|out| {
-            if out.status.success() {
-                Ok(())
-            } else {
-                let stderr = String::from_utf8_lossy(&out.stderr);
-                let stdout = String::from_utf8_lossy(&out.stdout);
-                let msg = if stderr.trim().is_empty() {
-                    stdout
-                } else {
-                    stderr
-                };
-                Err(format!("ncmc failed: {}", msg.trim()))
-            }
-        });
-    let _ = fs::remove_file(&staged);
-    let stem = staged
+fn convert_one(src: &Path, out_dir: &Path, tag_ctx: &TagCtx) -> Result<bool, String> {
+    let stem = src
         .file_stem()
         .and_then(|s| s.to_str())
-        .unwrap_or_default()
+        .ok_or_else(|| format!("bad file name: {}", src.display()))?
         .to_string();
-    let produced = find_produced(out_dir, &stem);
-    match (result, produced) {
-        (Ok(()), Some(p)) => Ok(p),
-        (Ok(()), None) => Err("ncmc reported success but no audio file was produced".into()),
-        (Err(e), _) => Err(e),
+
+    let file = fs::File::open(src).map_err(|e| format!("cannot open {}: {e}", src.display()))?;
+    let mut decoder =
+        ncm_core::decoder::Decoder::decode(file).map_err(|e| format!("ncm decode failed: {e}"))?;
+
+    let out_path = out_dir.join(format!("{stem}.{}", decoder.ext()));
+    let mut out = fs::File::create(&out_path)
+        .map_err(|e| format!("cannot create {}: {e}", out_path.display()))?;
+    std::io::copy(&mut decoder.audio, &mut out)
+        .map_err(|e| format!("writing {} failed: {e}", out_path.display()))?;
+    println!("[ok] {} -> {}", src.display(), out_path.display());
+
+    let embedded_image = decoder.image.take();
+    match tag_file(&out_path, src, &decoder.meta, embedded_image, tag_ctx) {
+        Ok(Some(msg)) => {
+            println!("[tag] {}: {msg}", out_path.display());
+            Ok(true)
+        }
+        Ok(None) => Ok(false),
+        Err(e) => {
+            eprintln!("[warn] {}: tagging skipped: {e}", out_path.display());
+            Ok(false)
+        }
     }
 }
 
 fn main() {
     let args = match parse_args() {
         Ok(a) => a,
-        Err(e) => {
-            eprintln!("{e}");
-            std::process::exit(2);
-        }
-    };
-    let ncmc = match find_ncmc(args.ncmc.as_deref()) {
-        Ok(p) => p,
         Err(e) => {
             eprintln!("{e}");
             std::process::exit(2);
@@ -610,12 +458,11 @@ fn main() {
         std::process::exit(2);
     }
     println!(
-        "converting {} file(s) from {} to {} with {} thread(s), using ncmc: {}",
+        "converting {} file(s) from {} to {} with {} thread(s)",
         files.len(),
         args.input.display(),
         args.output.display(),
-        args.threads,
-        ncmc.display()
+        args.threads
     );
 
     let meta_dir = args.meta_dir.unwrap_or_else(|| args.input.join("meta"));
@@ -639,20 +486,11 @@ fn main() {
                     break;
                 }
                 let src = &files[i];
-                match convert_one(&ncmc, src, &out_dir) {
-                    Ok(produced) => {
-                        println!("[ok] {} -> {}", src.display(), produced.display());
-                        match tag_produced(src, &produced, &tag_ctx) {
-                            Ok(Some(msg)) => {
-                                println!("[tag] {}: {msg}", produced.display());
-                                tagged.fetch_add(1, Ordering::SeqCst);
-                            }
-                            Ok(None) => {}
-                            Err(e) => {
-                                eprintln!("[warn] {}: tagging skipped: {e}", produced.display());
-                            }
-                        }
+                match convert_one(src, &out_dir, &tag_ctx) {
+                    Ok(true) => {
+                        tagged.fetch_add(1, Ordering::SeqCst);
                     }
+                    Ok(false) => {}
                     Err(e) => {
                         eprintln!("[fail] {}: {e}", src.display());
                         failed.fetch_add(1, Ordering::SeqCst);
