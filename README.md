@@ -1,8 +1,6 @@
 # dj-music-suite
 
-Batch convert NetEase Cloud Music `.ncm` files to plain audio (mp3/flac), then automatically embed album art and lyrics into the ID3 tags.
-
-Single self-contained Rust binary — decryption is built in via [ncm_core](https://github.com/magic-akari/ncmc) and tagging uses the `id3` crate. No ffmpeg, no external tools.
+Save mp3 and then automatically embed album art and lyrics into the ID3 tags.
 
 ## Usage
 
@@ -10,20 +8,6 @@ Single self-contained Rust binary — decryption is built in via [ncm_core](http
 cargo build --release
 ./target/release/dj-music-suite --input <DIR> --output <DIR>
 ```
-
-Expected input layout (extra files are optional):
-
-```
-music/
-├── ARTMS - BURN.ncm
-├── ARTMS - BURN.lrc          # optional: embedded as synced lyrics (USLT)
-└── meta/
-    └── track-<musicId>.jpg   # optional: embedded as cover art (APIC)
-```
-
-`<musicId>` is the NetEase track id, read from the `.ncm` metadata automatically.
-
-Cover priority: `<input>/meta/track-<musicId>.jpg` → image embedded in the `.ncm` (if any) → download from the album art URL stored inside the `.ncm` file.
 
 ## Options
 
@@ -35,12 +19,6 @@ Cover priority: `<input>/meta/track-<musicId>.jpg` → image embedded in the `.n
 | `--meta-dir <DIR>` | cover folder (default: `<input>/meta`) |
 | `--no-download` | never fetch missing covers from NetEase |
 
-## Notes
-
-- Audio streams are decoded bit-for-bit; only ID3 tags are added.
-- NetEase's JSON-flavored LRC lines (`{"t":..,"c":[..]}`) are normalized to standard `[mm:ss.xxx]` LRC before embedding.
-- Apple Music/iTunes does not display embedded lyrics; Poweramp, Musicolet, foobar2000 etc. do.
-
 ## Acknowledgements
 
-- [magic-akari/ncmc](https://github.com/magic-akari/ncmc) (`ncm_core`, MIT) — NCM decryption, and [anonymous5l/ncmdump](https://github.com/anonymous5l/ncmdump) before it
+- [magic-akari/ncmc](https://github.com/magic-akari/ncmc) for `ncm-core`.
