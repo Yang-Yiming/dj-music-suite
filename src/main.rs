@@ -7,10 +7,22 @@ use std::thread;
 use id3::TagLike;
 
 const USAGE: &str = "\
-dj-music-suite - batch convert .ncm files and embed cover art + lyrics
+dj-music-suite - a suite of small tools for music files
 
-Usage: dj-music-suite --input <DIR> --output <DIR> [--threads <N>]
-                      [--meta-dir <DIR>] [--no-download]
+Usage: dj-music-suite <COMMAND> [OPTIONS]
+       dj-music-suite help [COMMAND]
+
+Commands:
+    convert    batch convert .ncm files and embed cover art + lyrics
+
+Run 'dj-music-suite help convert' (or 'convert --help') for command options.
+Omitting the command (e.g. 'dj-music-suite --input <DIR>') still runs 'convert'.";
+
+const CONVERT_USAGE: &str = "\
+dj-music-suite convert - batch convert .ncm files and embed cover art + lyrics
+
+Usage: dj-music-suite convert --input <DIR> --output <DIR> [--threads <N>]
+                              [--meta-dir <DIR>] [--no-download]
 
 Options:
     --input <DIR>     folder containing .ncm files
@@ -34,17 +46,17 @@ struct Args {
     no_download: bool,
 }
 
-fn parse_args() -> Result<Args, String> {
+fn parse_convert_args(args: impl Iterator<Item = String>) -> Result<Args, String> {
     let mut input = None;
     let mut output = None;
     let mut threads = 8;
     let mut meta_dir = None;
     let mut no_download = false;
-    let mut iter = env::args().skip(1);
+    let mut iter = args;
     while let Some(arg) = iter.next() {
         match arg.as_str() {
             "-h" | "--help" => {
-                println!("{USAGE}");
+                println!("{CONVERT_USAGE}");
                 std::process::exit(0);
             }
             "--input" => {
@@ -66,12 +78,16 @@ fn parse_args() -> Result<Args, String> {
             "--no-download" => {
                 no_download = true;
             }
-            other => return Err(format!("unknown argument: {other}\n\n{USAGE}")),
+            other => return Err(format!("unknown argument: {other}\n\n{CONVERT_USAGE}")),
         }
     }
     Ok(Args {
-        input: PathBuf::from(input.ok_or("--input is required (e.g. --input test)")?),
-        output: PathBuf::from(output.ok_or("--output is required (e.g. --output test-mp3)")?),
+        input: PathBuf::from(input.ok_or_else(|| {
+            format!("--input is required (e.g. --input test)\n\n{CONVERT_USAGE}")
+        })?),
+        output: PathBuf::from(output.ok_or_else(|| {
+            format!("--output is required (e.g. --output test-mp3)\n\n{CONVERT_USAGE}")
+        })?),
         threads,
         meta_dir: meta_dir.map(PathBuf::from),
         no_download,
@@ -434,28 +450,28 @@ fn convert_one(src: &Path, out_dir: &Path, tag_ctx: &TagCtx) -> Result<bool, Str
     }
 }
 
-fn main() {
-    let args = match parse_args() {
+fn cmd_convert(args: &[String]) -> i32 {
+    let args = match parse_convert_args(args.iter().cloned()) {
         Ok(a) => a,
         Err(e) => {
             eprintln!("{e}");
-            std::process::exit(2);
+            return 2;
         }
     };
     let files = match collect_ncm_files(&args.input) {
         Ok(f) => f,
         Err(e) => {
             eprintln!("{e}");
-            std::process::exit(2);
+            return 2;
         }
     };
     if files.is_empty() {
         eprintln!("no .ncm files found in {}", args.input.display());
-        std::process::exit(1);
+        return 1;
     }
     if let Err(e) = fs::create_dir_all(&args.output) {
         eprintln!("cannot create output dir {}: {e}", args.output.display());
-        std::process::exit(2);
+        return 2;
     }
     println!(
         "converting {} file(s) from {} to {} with {} thread(s)",
@@ -505,6 +521,49 @@ fn main() {
     let ok = files.len() - failed;
     println!("done: {ok} converted, {tagged} tagged, {failed} failed");
     if failed > 0 {
-        std::process::exit(1);
+        return 1;
+    }
+    0
+}
+
+fn main() {
+    let mut args: Vec<String> = env::args().skip(1).collect();
+    if args.is_empty() {
+        println!("{USAGE}");
+        std::process::exit(0);
+    }
+    let verb = match args.first() {
+        Some(a) if matches!(a.as_str(), "-h" | "--help") => {
+            println!("{USAGE}");
+            std::process::exit(0);
+        }
+        Some(a) if !a.starts_with('-') => args.remove(0),
+        _ => "convert".to_string(),
+    };
+    let code = match verb.as_str() {
+        "convert" => cmd_convert(&args),
+        "help" => cmd_help(&args),
+        other => {
+            eprintln!("unknown command: {other}\n\n{USAGE}");
+            2
+        }
+    };
+    std::process::exit(code);
+}
+
+fn cmd_help(args: &[String]) -> i32 {
+    match args.first().map(String::as_str) {
+        None => {
+            println!("{USAGE}");
+            0
+        }
+        Some("convert") => {
+            println!("{CONVERT_USAGE}");
+            0
+        }
+        Some(other) => {
+            eprintln!("unknown command: {other}\n\n{USAGE}");
+            2
+        }
     }
 }
