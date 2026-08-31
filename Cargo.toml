@@ -3,5 +3,11 @@ name = "dj-music-suite"
 version = "0.1.0"
 edition = "2021"
 
+[dependencies]
+id3 = "1"
+aes = "0.8"
+base64 = "0.22"
+serde_json = "1"
+
 [profile.release]
 strip = true
