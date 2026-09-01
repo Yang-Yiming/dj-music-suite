@@ -1,97 +1,54 @@
 use std::env;
+use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread;
+use clap::{Args as ClapArgs, CommandFactory, Parser, Subcommand};
 use id3::TagLike;
+use indicatif::{ProgressBar, ProgressStyle};
 
-const USAGE: &str = "\
-dj-music-suite - a suite of small tools for music files
-
-Usage: dj-music-suite <COMMAND> [OPTIONS]
-       dj-music-suite help [COMMAND]
-
-Commands:
-    convert    batch convert .ncm files and embed cover art + lyrics
-
-Run 'dj-music-suite help convert' (or 'convert --help') for command options.
-Omitting the command (e.g. 'dj-music-suite --input <DIR>') still runs 'convert'.";
-
-const CONVERT_USAGE: &str = "\
-dj-music-suite convert - batch convert .ncm files and embed cover art + lyrics
-
-Usage: dj-music-suite convert --input <DIR> --output <DIR> [--threads <N>]
-                              [--meta-dir <DIR>] [--no-download]
-
-Options:
-    --input <DIR>     folder containing .ncm files
-    --output <DIR>    folder to write converted audio files to
-    --threads <N>     number of parallel conversions (default: 8)
-    --meta-dir <DIR>  folder with track-<musicId>.jpg covers (default: <input>/meta)
-    --no-download     never fetch missing covers from the albumPic URL
-    -h, --help        print this help
-
-Decryption is built in (ncm_core), no external binaries are needed.
-Converted files are tagged automatically when possible: the cover comes from
-<meta-dir>/track-<musicId>.jpg, then the image embedded in the .ncm file, then
-the albumPic URL (unless --no-download); a same-named .lrc file is embedded
-as unsynced lyrics (USLT).";
-
-struct Args {
-    input: PathBuf,
-    output: PathBuf,
-    threads: usize,
-    meta_dir: Option<PathBuf>,
-    no_download: bool,
+#[derive(Parser)]
+#[command(
+    name = "dj-music-suite",
+    version,
+    about = "a suite of small tools for music files",
+    long_about = "dj-music-suite - a suite of small tools for music files\n\nDecryption is built in (ncm_core), no external binaries are needed.\nConverted files are tagged automatically when possible: the cover comes from\n<meta-dir>/track-<musicId>.jpg, then the image embedded in the .ncm file, then\nthe albumPic URL (unless --no-download; downloads are cached into <meta-dir>);\na same-named .lrc file is embedded as unsynced lyrics (USLT)."
+)]
+struct Cli {
+    #[command(subcommand)]
+    command: Option<Commands>,
 }
 
-fn parse_convert_args(args: impl Iterator<Item = String>) -> Result<Args, String> {
-    let mut input = None;
-    let mut output = None;
-    let mut threads = 8;
-    let mut meta_dir = None;
-    let mut no_download = false;
-    let mut iter = args;
-    while let Some(arg) = iter.next() {
-        match arg.as_str() {
-            "-h" | "--help" => {
-                println!("{CONVERT_USAGE}");
-                std::process::exit(0);
-            }
-            "--input" => {
-                input = Some(iter.next().ok_or("--input requires a value")?);
-            }
-            "--output" => {
-                output = Some(iter.next().ok_or("--output requires a value")?);
-            }
-            "--threads" => {
-                let v = iter.next().ok_or("--threads requires a value")?;
-                threads = v.parse().map_err(|_| format!("invalid --threads value: {v}"))?;
-                if threads == 0 {
-                    return Err("--threads must be at least 1".into());
-                }
-            }
-            "--meta-dir" => {
-                meta_dir = Some(iter.next().ok_or("--meta-dir requires a value")?);
-            }
-            "--no-download" => {
-                no_download = true;
-            }
-            other => return Err(format!("unknown argument: {other}\n\n{CONVERT_USAGE}")),
-        }
-    }
-    Ok(Args {
-        input: PathBuf::from(input.ok_or_else(|| {
-            format!("--input is required (e.g. --input test)\n\n{CONVERT_USAGE}")
-        })?),
-        output: PathBuf::from(output.ok_or_else(|| {
-            format!("--output is required (e.g. --output test-mp3)\n\n{CONVERT_USAGE}")
-        })?),
-        threads,
-        meta_dir: meta_dir.map(PathBuf::from),
-        no_download,
-    })
+#[derive(Subcommand)]
+enum Commands {
+    /// batch convert .ncm files and embed cover art + lyrics
+    Convert(ConvertOpts),
+}
+
+#[derive(ClapArgs)]
+struct ConvertOpts {
+    /// folder containing .ncm files
+    #[arg(long, value_name = "DIR")]
+    input: PathBuf,
+
+    /// folder to write converted audio files to
+    #[arg(long, value_name = "DIR")]
+    output: PathBuf,
+
+    /// number of parallel conversions
+    #[arg(long, value_name = "N", default_value_t = 8)]
+    threads: usize,
+
+    /// folder with track-<musicId> covers (default: <input>/meta); downloaded
+    /// covers are cached here
+    #[arg(long, value_name = "DIR")]
+    meta_dir: Option<PathBuf>,
+
+    /// never fetch missing covers from the albumPic URL
+    #[arg(long)]
+    no_download: bool,
 }
 
 fn is_ncm(p: &Path) -> bool {
@@ -178,6 +135,16 @@ fn normalize_lrc(raw: &str) -> String {
         }
     }
     out
+}
+
+fn image_ext_for_mime(mime: &str) -> Option<&'static str> {
+    match mime {
+        "image/jpeg" => Some("jpg"),
+        "image/png" => Some("png"),
+        "image/webp" => Some("webp"),
+        "image/gif" => Some("gif"),
+        _ => None,
+    }
 }
 
 fn sniff_mime(data: &[u8]) -> &'static str {
@@ -317,6 +284,29 @@ struct TagCtx {
     allow_download: bool,
 }
 
+/// Persist a freshly downloaded cover next to the local ones so later runs
+/// (including --no-download and offline use) find it locally. Returns a
+/// note for the log or an empty string if caching was not possible.
+fn cache_cover(ctx: &TagCtx, meta: &Option<NcmMeta>, mime: &str, data: &[u8]) -> String {
+    let (Some(meta_dir), Some(meta)) = (ctx.meta_dir.as_ref(), meta.as_ref()) else {
+        return String::new();
+    };
+    if meta.music_id.is_empty() {
+        return String::new();
+    }
+    let Some(ext) = image_ext_for_mime(mime) else {
+        return String::new();
+    };
+    let cache_path = meta_dir.join(format!("track-{}.{}", meta.music_id, ext));
+    if fs::create_dir_all(meta_dir)
+        .and_then(|_| fs::write(&cache_path, data))
+        .is_err()
+    {
+        return String::new();
+    }
+    format!(" (cached to {})", cache_path.display())
+}
+
 fn tag_file(
     produced: &Path,
     src: &Path,
@@ -344,7 +334,7 @@ fn tag_file(
     let mut cover_mime = String::new();
     let mut cover_data: Option<Vec<u8>> = None;
     if let (Some(meta_dir), Some(meta)) = (ctx.meta_dir.as_ref(), meta.as_ref()) {
-        if !meta.music_id.is_empty() {
+        if meta_dir.is_dir() && !meta.music_id.is_empty() {
             for ext in ["jpg", "jpeg", "png", "webp"] {
                 let p = meta_dir.join(format!("track-{}.{}", meta.music_id, ext));
                 if p.is_file() {
@@ -374,7 +364,10 @@ fn tag_file(
             match http_get(album_pic) {
                 Ok(data) => {
                     cover_mime = sniff_mime(&data).to_string();
-                    cover_origin = Some(format!("downloaded {album_pic}"));
+                    cover_origin = Some(format!(
+                        "downloaded {album_pic}{}",
+                        cache_cover(ctx, &meta, &cover_mime, &data)
+                    ));
                     cover_data = Some(data);
                 }
                 Err(e) => eprintln!("[warn] {}: {e}", src.display()),
@@ -418,7 +411,7 @@ fn tag_file(
     Ok(Some(summary.join(", ")))
 }
 
-fn convert_one(src: &Path, out_dir: &Path, tag_ctx: &TagCtx) -> Result<bool, String> {
+fn convert_one(src: &Path, out_dir: &Path, tag_ctx: &TagCtx, pb: &ProgressBar) -> Result<bool, String> {
     let stem = src
         .file_stem()
         .and_then(|s| s.to_str())
@@ -434,31 +427,28 @@ fn convert_one(src: &Path, out_dir: &Path, tag_ctx: &TagCtx) -> Result<bool, Str
         .map_err(|e| format!("cannot create {}: {e}", out_path.display()))?;
     std::io::copy(&mut decoder.audio, &mut out)
         .map_err(|e| format!("writing {} failed: {e}", out_path.display()))?;
-    println!("[ok] {} -> {}", src.display(), out_path.display());
+    pb.println(format!("[ok] {} -> {}", src.display(), out_path.display()));
 
     let embedded_image = decoder.image.take();
     match tag_file(&out_path, src, &decoder.meta, embedded_image, tag_ctx) {
         Ok(Some(msg)) => {
-            println!("[tag] {}: {msg}", out_path.display());
+            pb.println(format!("[tag] {}: {msg}", out_path.display()));
             Ok(true)
         }
         Ok(None) => Ok(false),
         Err(e) => {
-            eprintln!("[warn] {}: tagging skipped: {e}", out_path.display());
+            pb.println(format!("[warn] {}: tagging skipped: {e}", out_path.display()));
             Ok(false)
         }
     }
 }
 
-fn cmd_convert(args: &[String]) -> i32 {
-    let args = match parse_convert_args(args.iter().cloned()) {
-        Ok(a) => a,
-        Err(e) => {
-            eprintln!("{e}");
-            return 2;
-        }
-    };
-    let files = match collect_ncm_files(&args.input) {
+fn cmd_convert(opts: ConvertOpts) -> i32 {
+    if opts.threads == 0 {
+        eprintln!("--threads must be at least 1");
+        return 2;
+    }
+    let files = match collect_ncm_files(&opts.input) {
         Ok(f) => f,
         Err(e) => {
             eprintln!("{e}");
@@ -466,33 +456,35 @@ fn cmd_convert(args: &[String]) -> i32 {
         }
     };
     if files.is_empty() {
-        eprintln!("no .ncm files found in {}", args.input.display());
+        eprintln!("no .ncm files found in {}", opts.input.display());
         return 1;
     }
-    if let Err(e) = fs::create_dir_all(&args.output) {
-        eprintln!("cannot create output dir {}: {e}", args.output.display());
+    if let Err(e) = fs::create_dir_all(&opts.output) {
+        eprintln!("cannot create output dir {}: {e}", opts.output.display());
         return 2;
     }
-    println!(
-        "converting {} file(s) from {} to {} with {} thread(s)",
-        files.len(),
-        args.input.display(),
-        args.output.display(),
-        args.threads
-    );
 
-    let meta_dir = args.meta_dir.unwrap_or_else(|| args.input.join("meta"));
-    let meta_dir = if meta_dir.is_dir() { Some(meta_dir) } else { None };
+    // meta_dir is always resolved (even when the folder does not exist yet) so
+    // downloaded covers can be cached into it on the first run.
+    let meta_dir = Some(opts.meta_dir.unwrap_or_else(|| opts.input.join("meta")));
     let tag_ctx = TagCtx {
         meta_dir,
-        allow_download: !args.no_download,
+        allow_download: !opts.no_download,
     };
+
+    let pb = ProgressBar::new(files.len() as u64);
+    if let Ok(style) = ProgressStyle::with_template(
+        "{spinner:.green} [{elapsed_precise}] [{bar:32.cyan/blue}] {pos}/{len} ({eta}) {msg}",
+    ) {
+        pb.set_style(style.progress_chars("\u{2588}\u{2592}\u{2591}"));
+    }
+
     let files = Arc::new(files);
-    let out_dir = Arc::new(args.output);
+    let out_dir = Arc::new(opts.output);
     let next = AtomicUsize::new(0);
     let failed = AtomicUsize::new(0);
     let tagged = AtomicUsize::new(0);
-    let workers = args.threads.min(files.len());
+    let workers = opts.threads.min(files.len());
 
     thread::scope(|s| {
         for _ in 0..workers {
@@ -502,16 +494,18 @@ fn cmd_convert(args: &[String]) -> i32 {
                     break;
                 }
                 let src = &files[i];
-                match convert_one(src, &out_dir, &tag_ctx) {
+                pb.set_message(src.display().to_string());
+                match convert_one(src, &out_dir, &tag_ctx, &pb) {
                     Ok(true) => {
                         tagged.fetch_add(1, Ordering::SeqCst);
                     }
                     Ok(false) => {}
                     Err(e) => {
-                        eprintln!("[fail] {}: {e}", src.display());
+                        pb.println(format!("[fail] {}: {e}", src.display()));
                         failed.fetch_add(1, Ordering::SeqCst);
                     }
                 }
+                pb.inc(1);
             });
         }
     });
@@ -519,6 +513,7 @@ fn cmd_convert(args: &[String]) -> i32 {
     let failed = failed.load(Ordering::SeqCst);
     let tagged = tagged.load(Ordering::SeqCst);
     let ok = files.len() - failed;
+    pb.finish_and_clear();
     println!("done: {ok} converted, {tagged} tagged, {failed} failed");
     if failed > 0 {
         return 1;
@@ -527,43 +522,30 @@ fn cmd_convert(args: &[String]) -> i32 {
 }
 
 fn main() {
-    let mut args: Vec<String> = env::args().skip(1).collect();
-    if args.is_empty() {
-        println!("{USAGE}");
+    let raw: Vec<OsString> = env::args_os().skip(1).collect();
+    if raw.is_empty() {
+        let _ = Cli::command().print_help();
+        println!();
         std::process::exit(0);
     }
-    let verb = match args.first() {
-        Some(a) if matches!(a.as_str(), "-h" | "--help") => {
-            println!("{USAGE}");
-            std::process::exit(0);
-        }
-        Some(a) if !a.starts_with('-') => args.remove(0),
-        _ => "convert".to_string(),
+    // Back-compat: bare flags (e.g. `dj-music-suite --input <DIR> ...`) still
+    // run `convert`. Top-level -h/-V are handled by clap as before.
+    let first = raw[0].to_string_lossy();
+    let cli = if first == "-h" || first == "--help" || first == "-V" || first == "--version" {
+        Cli::parse_from(std::iter::once(OsString::from("dj-music-suite")).chain(raw))
+    } else if first.starts_with('-') {
+        let mut argv = vec![OsString::from("dj-music-suite"), OsString::from("convert")];
+        argv.extend(raw);
+        Cli::parse_from(argv)
+    } else {
+        Cli::parse_from(std::iter::once(OsString::from("dj-music-suite")).chain(raw))
     };
-    let code = match verb.as_str() {
-        "convert" => cmd_convert(&args),
-        "help" => cmd_help(&args),
-        other => {
-            eprintln!("unknown command: {other}\n\n{USAGE}");
-            2
+    let code = match cli.command {
+        Some(Commands::Convert(opts)) => cmd_convert(opts),
+        None => {
+            let _ = Cli::command().print_help();
+            0
         }
     };
     std::process::exit(code);
-}
-
-fn cmd_help(args: &[String]) -> i32 {
-    match args.first().map(String::as_str) {
-        None => {
-            println!("{USAGE}");
-            0
-        }
-        Some("convert") => {
-            println!("{CONVERT_USAGE}");
-            0
-        }
-        Some(other) => {
-            eprintln!("unknown command: {other}\n\n{USAGE}");
-            2
-        }
-    }
 }
