@@ -5,12 +5,10 @@ use std::path::{Path, PathBuf};
 use clap::Args;
 use indicatif::{ProgressBar, ProgressStyle};
 use serde::{Deserialize, Serialize};
-use walkdir::{DirEntry, WalkDir};
 
+use crate::scan::{file_name, scan_audio};
 use crate::tags::{self, TrackMeta};
 use crate::template::{RenderValues, Template};
-
-const AUDIO_EXTS: &[&str] = &["mp3", "flac", "m4a", "aac", "wav", "aiff", "aif"];
 
 #[derive(Args)]
 pub struct ReorgOpts {
@@ -359,41 +357,6 @@ fn in_place(src: &Path, dst: &Path) -> PlanEntry {
         status: "in-place".to_string(),
         note: None,
     }
-}
-
-fn scan_audio(root: &Path) -> Vec<PathBuf> {
-    let mut files: Vec<PathBuf> = WalkDir::new(root)
-        .into_iter()
-        .filter_entry(|e| e.depth() == 0 || !is_hidden(e))
-        .filter_map(|e| e.ok())
-        .filter(|e| e.file_type().is_file())
-        .map(DirEntry::into_path)
-        .filter(|p| is_audio(p))
-        .collect();
-    files.sort();
-    files
-}
-
-fn is_hidden(entry: &DirEntry) -> bool {
-    entry
-        .file_name()
-        .to_str()
-        .map(|n| n.starts_with('.'))
-        .unwrap_or(false)
-}
-
-fn is_audio(p: &Path) -> bool {
-    p.extension()
-        .and_then(|e| e.to_str())
-        .map(|e| AUDIO_EXTS.contains(&e.to_ascii_lowercase().as_str()))
-        .unwrap_or(false)
-}
-
-fn file_name(p: &Path) -> String {
-    p.file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or("?")
-        .to_string()
 }
 
 fn print_report(plan: &Plan, plan_path: &Path) {

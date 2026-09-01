@@ -1,5 +1,7 @@
 mod convert;
+mod import;
 mod reorg;
+mod scan;
 mod tags;
 mod template;
 
@@ -13,7 +15,7 @@ use clap::{CommandFactory, Parser, Subcommand};
     name = "dj-music-suite",
     version,
     about = "a suite of small tools for music files",
-    long_about = "dj-music-suite - a suite of small tools for music files\n\nDecryption is built in (ncm_core), no external binaries are needed.\nConverted files are tagged automatically when possible: title, artist and\nalbum come from the .ncm metadata; the cover comes from\n<meta-dir>/track-<musicId>.jpg, then the image embedded in the .ncm file, then\nthe albumPic URL (unless --no-download; downloads are cached into <meta-dir>);\na same-named .lrc file is embedded as unsynced lyrics (USLT).\n\n`reorg` moves the files of a music library folder into a tag-based layout.\nIt only touches the filesystem: analyze first, then let rekordbox relink the\nmoved files via File -> Display All Missing Files -> Relocate."
+    long_about = "dj-music-suite - a suite of small tools for music files\n\nDecryption is built in (ncm_core), no external binaries are needed.\nConverted files are tagged automatically when possible: title, artist and\nalbum come from the .ncm metadata; the cover comes from\n<meta-dir>/track-<musicId>.jpg, then the image embedded in the .ncm file, then\nthe albumPic URL (unless --no-download; downloads are cached into <meta-dir>);\na same-named .lrc file is embedded as unsynced lyrics (USLT).\n\n`import` copies (or moves) new audio files into the music library folder,\ndeduplicating against what is already there: same artist + title and a\nsimilar duration is skipped as a duplicate, a different duration is imported\nas an alternate version.\n\n`reorg` moves the files of a music library folder into a tag-based layout.\nIt only touches the filesystem: analyze first, then let rekordbox relink the\nmoved files via File -> Display All Missing Files -> Relocate."
 )]
 struct Cli {
     #[command(subcommand)]
@@ -24,6 +26,8 @@ struct Cli {
 enum Commands {
     /// batch convert .ncm files and embed cover art + lyrics
     Convert(convert::ConvertOpts),
+    /// copy new audio files into the music library with duplicate detection
+    Import(import::ImportOpts),
     /// reorganize a music library folder on disk (analyze by default)
     Reorg(reorg::ReorgOpts),
 }
@@ -49,6 +53,7 @@ fn main() {
     };
     let code = match cli.command {
         Some(Commands::Convert(opts)) => convert::cmd_convert(opts),
+        Some(Commands::Import(opts)) => import::cmd_import(opts),
         Some(Commands::Reorg(opts)) => reorg::cmd_reorg(opts),
         None => {
             let _ = Cli::command().print_help();
