@@ -43,7 +43,8 @@ Copies (or moves) new audio files into the music library folder — the gate
 before files enter the library. Detection against the existing library: same
 artist + title with a similar duration (±3 s) is skipped as a duplicate; a
 different duration is treated as an alternate version (another mix) and
-imported; a target that already exists is never overwritten.
+imported; a target that already exists is never overwritten unless
+`--overwrite` is given.
 
 ```bash
 ./target/release/dj-music-suite import --input <DIR> --root <MUSIC_DIR>            # report only
@@ -56,6 +57,7 @@ imported; a target that already exists is never overwritten.
 | `--root <DIR>` | music library root to import into (must exist, required) |
 | `--template <T>` | destination layout relative to root (default `{artist}/{filename}.{ext}`); placeholders: `{artist}` `{title}` `{album}` `{filename}` `{ext}` |
 | `--mode <copy\|move>` | copy (default) or move the files into the library |
+| `--overwrite` | on duplicate/conflict, replace the existing library file with the incoming one (atomic tmp+rename; duplicates are replaced in place, keeping the library path) |
 | `--execute` | actually place the files (default: report only) |
 
 Typical flow: `convert` into a staging folder, review the import report, then

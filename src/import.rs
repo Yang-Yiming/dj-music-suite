@@ -31,6 +31,11 @@ pub struct ImportOpts {
     #[arg(long, value_enum, default_value_t = Mode::Copy)]
     mode: Mode,
 
+    /// on duplicate/conflict, replace the existing library file with the
+    /// incoming one instead of skipping (atomic tmp+rename)
+    #[arg(long)]
+    overwrite: bool,
+
     /// actually place the files (default: report only)
     #[arg(long)]
     execute: bool,
@@ -60,6 +65,9 @@ enum Disposition {
 struct Item {
     src: PathBuf,
     dst: Option<PathBuf>,
+    /// for duplicates: the matched library file that --overwrite would
+    /// replace (content refreshed in place, path unchanged)
+    replace: Option<PathBuf>,
     disposition: Disposition,
     note: Option<String>,
 }
@@ -136,9 +144,9 @@ pub fn cmd_import(opts: ImportOpts) -> i32 {
     }
     pb.finish_and_clear();
 
-    print_report(&items, &input, &root, &opts.template, opts.mode);
+    print_report(&items, &input, &root, &opts.template, opts.mode, opts.overwrite);
     if opts.execute {
-        place(&items, opts.mode)
+        place(&items, opts.mode, opts.overwrite)
     } else {
         0
     }
@@ -169,6 +177,7 @@ fn classify_item(src: &Path, root: &Path, template: &Template, index: &mut Index
             return Item {
                 src: src.to_path_buf(),
                 dst: None,
+                replace: None,
                 disposition: Disposition::Untagged,
                 note: Some(reason),
             };
@@ -181,6 +190,7 @@ fn classify_item(src: &Path, root: &Path, template: &Template, index: &mut Index
         return Item {
             src: src.to_path_buf(),
             dst: Some(dst),
+            replace: None,
             disposition: Disposition::Conflict,
             note: Some("target already exists (imported before?)".to_string()),
         };
@@ -198,6 +208,7 @@ fn classify_item(src: &Path, root: &Path, template: &Template, index: &mut Index
                     Some(entry) => Item {
                         src: src.to_path_buf(),
                         dst: Some(dst),
+                        replace: Some(entry.path.clone()),
                         disposition: Disposition::Duplicate,
                         note: Some(format!(
                             "library already has {} ({})",
@@ -210,6 +221,7 @@ fn classify_item(src: &Path, root: &Path, template: &Template, index: &mut Index
                         Item {
                             src: src.to_path_buf(),
                             dst: Some(dst),
+                            replace: None,
                             disposition: Disposition::AltVersion,
                             note: Some(format!(
                                 "library has {} ({}), duration differs; \
@@ -233,6 +245,7 @@ fn classify_item(src: &Path, root: &Path, template: &Template, index: &mut Index
     Item {
         src: src.to_path_buf(),
         dst: Some(dst),
+        replace: None,
         disposition: Disposition::New,
         note: None,
     }
@@ -246,7 +259,14 @@ fn close(a: Option<u64>, b: Option<u64>) -> bool {
     }
 }
 
-fn print_report(items: &[Item], input: &Path, root: &Path, template: &str, mode: Mode) {
+fn print_report(
+    items: &[Item],
+    input: &Path,
+    root: &Path,
+    template: &str,
+    mode: Mode,
+    overwrite: bool,
+) {
     let mut counts: BTreeMap<&'static str, usize> = BTreeMap::new();
     for item in items {
         let key = match item.disposition {
@@ -258,6 +278,17 @@ fn print_report(items: &[Item], input: &Path, root: &Path, template: &str, mode:
         };
         *counts.entry(key).or_default() += 1;
     }
+    let (dup_hint, conflict_hint) = if overwrite {
+        (
+            "will replace the matched library file",
+            "will overwrite the target file",
+        )
+    } else {
+        (
+            "skipped: same artist + title in library",
+            "skipped: target exists",
+        )
+    };
     println!("import analysis");
     println!("  input: {}", input.display());
     println!("  library: {}", root.display());
@@ -266,8 +297,8 @@ fn print_report(items: &[Item], input: &Path, root: &Path, template: &str, mode:
     for (key, label, hint) in [
         ("new", "new", ""),
         ("alt-version", "alt-version", "imported: same song, different duration"),
-        ("duplicate", "duplicate", "skipped: same artist + title in library"),
-        ("conflict", "conflict", "skipped: target exists"),
+        ("duplicate", "duplicate", dup_hint),
+        ("conflict", "conflict", conflict_hint),
         ("untagged", "untagged", "skipped: missing tags for template"),
     ] {
         let n = counts.get(key).copied().unwrap_or(0);
@@ -292,25 +323,41 @@ fn print_report(items: &[Item], input: &Path, root: &Path, template: &str, mode:
             );
         }
     }
-    let n = counts.get("new").copied().unwrap_or(0)
+    let placed = counts.get("new").copied().unwrap_or(0)
         + counts.get("alt-version").copied().unwrap_or(0);
+    let replaced = if overwrite {
+        counts.get("duplicate").copied().unwrap_or(0)
+            + counts.get("conflict").copied().unwrap_or(0)
+    } else {
+        0
+    };
     let verb = match mode {
         Mode::Copy => "copied",
         Mode::Move => "moved",
     };
-    if n == 0 {
+    let total = placed + replaced;
+    if total == 0 {
         println!();
         println!("nothing to import");
+    } else if replaced > 0 {
+        println!();
+        println!(
+            "with --execute: {placed} file(s) and {replaced} replacement(s) would be {verb} into the library"
+        );
     } else {
         println!();
-        println!("with --execute: {n} file(s) would be {verb} into the library");
+        println!("with --execute: {total} file(s) would be {verb} into the library");
     }
 }
 
-fn place(items: &[Item], mode: Mode) -> i32 {
+fn place(items: &[Item], mode: Mode, overwrite: bool) -> i32 {
     let actionable: Vec<&Item> = items
         .iter()
-        .filter(|i| matches!(i.disposition, Disposition::New | Disposition::AltVersion))
+        .filter(|i| match i.disposition {
+            Disposition::New | Disposition::AltVersion => true,
+            Disposition::Conflict | Disposition::Duplicate => overwrite,
+            Disposition::Untagged => false,
+        })
         .collect();
     let pb = progress_bar(actionable.len() as u64);
     let verb = match mode {
@@ -321,31 +368,56 @@ fn place(items: &[Item], mode: Mode) -> i32 {
     let mut placed = 0usize;
     let mut failed = 0usize;
     for item in &actionable {
-        let Some(dst) = item.dst.as_deref() else {
+        let target = match item.disposition {
+            // replacements land at the matched library file's path
+            Disposition::Duplicate => item.replace.as_deref(),
+            _ => item.dst.as_deref(),
+        };
+        let Some(target) = target else {
             pb.inc(1);
             continue;
         };
-        let result = dst
+        if item.src == target {
+            pb.println(format!(
+                "[skip] {} is already the library file",
+                item.src.display()
+            ));
+            pb.inc(1);
+            continue;
+        }
+        let result = target
             .parent()
             .map(fs::create_dir_all)
             .unwrap_or_else(|| Ok(()))
-            .and_then(|_| match mode {
-                Mode::Copy => fs::copy(&item.src, dst).map(|_| ()),
-                Mode::Move => move_file(&item.src, dst),
-            });
-        match result {
-            Ok(()) => {
-                placed += 1;
-                pb.println(format!(
-                    "[ok] {verb} {} -> {}",
-                    item.src.display(),
-                    dst.display()
-                ));
+            .and_then(|_| atomic_place(&item.src, target));
+        let placed_ok = result.is_ok();
+        if let Err(e) = result {
+            failed += 1;
+            pb.println(format!("[fail] {}: {e}", item.src.display()));
+        }
+        if placed_ok {
+            if mode == Mode::Move {
+                if let Err(e) = fs::remove_file(&item.src) {
+                    failed += 1;
+                    pb.println(format!(
+                        "[warn] copied but cannot remove {}: {e}",
+                        item.src.display()
+                    ));
+                }
             }
-            Err(e) => {
-                failed += 1;
-                pb.println(format!("[fail] {}: {e}", item.src.display()));
-            }
+            placed += 1;
+            let what = if matches!(item.disposition, Disposition::Conflict | Disposition::Duplicate)
+            {
+                "replaced"
+            } else {
+                verb
+            };
+            pb.println(format!(
+                "[ok] {} {} -> {}",
+                what,
+                item.src.display(),
+                target.display()
+            ));
         }
         pb.inc(1);
     }
@@ -361,11 +433,16 @@ fn place(items: &[Item], mode: Mode) -> i32 {
     }
 }
 
-/// move across devices: rename fails with an error, fall back to copy + delete
-fn move_file(src: &Path, dst: &Path) -> std::io::Result<()> {
-    fs::rename(src, dst).or_else(|_| {
-        fs::copy(src, dst).and_then(|_| fs::remove_file(src)).map(|_| ())
-    })
+/// Copy `src` onto `dst` atomically: write a hidden temp file next to `dst`,
+/// then rename over it, so a failed copy never corrupts an existing library
+/// file (this includes overwrite placements).
+fn atomic_place(src: &Path, dst: &Path) -> std::io::Result<()> {
+    let tmp = dst.with_file_name(format!(".djms-tmp-{}-{}", std::process::id(), file_name(dst)));
+    let result = fs::copy(src, &tmp).and_then(|_| fs::rename(&tmp, dst));
+    if result.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    result.map(|_| ())
 }
 
 fn progress_bar(len: u64) -> ProgressBar {
@@ -491,7 +568,10 @@ mod tests {
         write_tagged(&staging.join("fresh.mp3"), "B", "T", 100);
         let item = classify_item(&staging.join("fresh.mp3"), &lib, &template, &mut index);
         assert_eq!(item.disposition, Disposition::New);
-        assert_eq!(place(std::slice::from_ref(&item), Mode::Move), 0);
+        assert_eq!(
+            place(std::slice::from_ref(&item), Mode::Move, false),
+            0
+        );
 
         let dst = item.dst.clone().unwrap();
         assert!(dst.is_file());
@@ -505,5 +585,56 @@ mod tests {
             .find(|i| i.src == dst)
             .unwrap();
         assert_eq!(rerun.disposition, Disposition::Conflict);
+    }
+
+    #[test]
+    fn conflict_overwrite_replaces_target() {
+        let (lib, staging, template, mut index) = setup("ovr-conflict");
+        write_tagged(&staging.join("exists.mp3"), "A", "T", 300);
+        let item = classify_item(&staging.join("exists.mp3"), &lib, &template, &mut index);
+        assert_eq!(item.disposition, Disposition::Conflict);
+
+        let dst = item.dst.clone().unwrap();
+        assert_eq!(place(std::slice::from_ref(&item), Mode::Copy, true), 0);
+        // the library file now carries the incoming content, byte for byte
+        assert_eq!(
+            fs::read(&dst).unwrap(),
+            fs::read(staging.join("exists.mp3")).unwrap()
+        );
+        // copy mode: the source is untouched
+        assert!(staging.join("exists.mp3").is_file());
+    }
+
+    #[test]
+    fn duplicate_overwrite_replaces_matched_library_file() {
+        let (lib, staging, template, mut index) = setup("ovr-dup");
+        // 101 frames -> same duration bucket as the 100-frame library file,
+        // but a different size so the replacement is observable
+        write_tagged(&staging.join("renamed.mp3"), "A", "T", 101);
+        let item = classify_item(&staging.join("renamed.mp3"), &lib, &template, &mut index);
+        assert_eq!(item.disposition, Disposition::Duplicate);
+        let matched = item.replace.clone().unwrap();
+        assert_eq!(matched, lib.join("exists.mp3"));
+        let incoming = fs::read(staging.join("renamed.mp3")).unwrap();
+
+        assert_eq!(place(std::slice::from_ref(&item), Mode::Move, true), 0);
+        // the library keeps its path but carries the incoming content
+        assert_eq!(fs::read(&matched).unwrap(), incoming);
+        // move mode + replacement: the incoming file is consumed, and no
+        // extra copy under its own name was created
+        assert!(!staging.join("renamed.mp3").exists());
+        assert_eq!(scan_audio(&lib).len(), 1);
+    }
+
+    #[test]
+    fn self_import_is_skipped_not_corrupted() {
+        let (lib, staging, template, mut index) = setup("self");
+        // import the library file itself (e.g. --input inside --root):
+        // conflict, and overwriting it must be refused
+        let item = classify_item(&lib.join("exists.mp3"), &lib, &template, &mut index);
+        assert_eq!(item.disposition, Disposition::Conflict);
+        let before = fs::read(lib.join("exists.mp3")).unwrap();
+        assert_eq!(place(std::slice::from_ref(&item), Mode::Copy, true), 0);
+        assert_eq!(fs::read(lib.join("exists.mp3")).unwrap(), before);
     }
 }
