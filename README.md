@@ -54,8 +54,7 @@ imported; a target that already exists is never overwritten unless
 | Option | Description |
 | --- | --- |
 | `--input <DIR>` | folder with new audio files (scanned recursively, required) |
-| `--root <DIR>` | music library root to import into (must exist, required) |
-| `--template <T>` | destination layout relative to root (default `{artist}/{filename}.{ext}`); placeholders: `{artist}` `{title}` `{album}` `{filename}` `{ext}` |
+| `--template <T>` | destination layout relative to root (default `{artist}/{filename}.{ext}`); placeholders: `{artist}` `{artists}` `{title}` `{album}` `{filename}` `{ext}` |
 | `--mode <copy\|move>` | copy (default) or move the files into the library |
 | `--overwrite` | on duplicate/conflict, replace the existing library file with the incoming one (atomic tmp+rename; duplicates are replaced in place, keeping the library path) |
 | `--execute` | actually place the files (default: report only) |
@@ -79,8 +78,7 @@ Relocate* (point it at the library root; it matches by filename).
 
 | Option | Description |
 | --- | --- |
-| `--root <DIR>` | music library folder to reorganize |
-| `--template <T>` | destination layout relative to root (default `{artist}/{filename}.{ext}`); placeholders: `{artist}` `{title}` `{album}` `{filename}` `{ext}` |
+| `--template <T>` | destination layout relative to root (default `{artist}/{filename}.{ext}`); placeholders: `{artist}` `{artists}` `{title}` `{album}` `{filename}` `{ext}` |
 | `--execute` | actually move files (default: analyze only) |
 | `--from <FILE>` | execute a previously generated plan json instead of re-analyzing |
 | `--allow-rename` | also apply renames — rekordbox relocates by filename, so renamed files must be relinked manually one by one |

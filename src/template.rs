@@ -4,7 +4,10 @@
 
 #[derive(Clone, Copy, PartialEq)]
 enum Ph {
+    /// primary artist: album artist, or first of the artist list
     Artist,
+    /// full artist list as stored in the tag
+    Artists,
     Title,
     Album,
     Filename,
@@ -13,19 +16,21 @@ enum Ph {
 
 impl Ph {
     fn parse(name: &str) -> Option<Ph> {
-        match name {
-            "artist" => Some(Ph::Artist),
-            "title" => Some(Ph::Title),
-            "album" => Some(Ph::Album),
-            "filename" => Some(Ph::Filename),
-            "ext" => Some(Ph::Ext),
-            _ => None,
-        }
+        Some(match name {
+            "artist" => Ph::Artist,
+            "artists" => Ph::Artists,
+            "title" => Ph::Title,
+            "album" => Ph::Album,
+            "filename" => Ph::Filename,
+            "ext" => Ph::Ext,
+            _ => return None,
+        })
     }
 
     fn name(&self) -> &'static str {
         match self {
             Ph::Artist => "artist",
+            Ph::Artists => "artists",
             Ph::Title => "title",
             Ph::Album => "album",
             Ph::Filename => "filename",
@@ -44,6 +49,7 @@ pub struct Template {
 }
 
 pub struct RenderValues<'a> {
+    pub primary_artist: Option<&'a str>,
     pub artist: Option<&'a str>,
     pub title: Option<&'a str>,
     pub album: Option<&'a str>,
@@ -79,7 +85,7 @@ impl Template {
                 };
                 let name = after[..end].trim();
                 let ph = Ph::parse(name).ok_or_else(|| {
-                    format!("unknown placeholder {{{name}}} (valid: artist, title, album, filename, ext)")
+                    format!("unknown placeholder {{{name}}} (valid: artist, artists, title, album, filename, ext)")
                 })?;
                 parts.push(Part::Placeholder(ph));
                 rest = &after[end + 1..];
@@ -103,7 +109,8 @@ impl Template {
                     Part::Text(text) => component.push_str(text),
                     Part::Placeholder(ph) => {
                         let value = match ph {
-                            Ph::Artist => vals.artist,
+                            Ph::Artist => vals.primary_artist,
+                            Ph::Artists => vals.artist,
                             Ph::Title => vals.title,
                             Ph::Album => vals.album,
                             Ph::Filename => Some(vals.filename),
@@ -149,6 +156,7 @@ mod tests {
 
     fn vals<'a>() -> RenderValues<'a> {
         RenderValues {
+            primary_artist: Some("ARTMS"),
             artist: Some("ARTMS"),
             title: Some("BURN"),
             album: None,
@@ -165,6 +173,34 @@ mod tests {
         assert!(Template::parse("a/..").is_err());
         assert!(Template::parse("{nope}").is_err());
         assert!(Template::parse("{artist").is_err());
+    }
+
+    #[test]
+    fn render_artist_is_primary_artists_is_full_list() {
+        let v = RenderValues {
+            primary_artist: Some("Ahadadream"),
+            artist: Some("Ahadadream/Skrillex/Raf Saperra"),
+            title: Some("Bass Dhol"),
+            album: None,
+            filename: "x",
+            ext: "mp3",
+        };
+        let t = Template::parse("{artists} - {title}.{ext}").unwrap();
+        assert_eq!(
+            t.render(&v).unwrap(),
+            vec!["Ahadadream_Skrillex_Raf Saperra - Bass Dhol.mp3"]
+        );
+        let t = Template::parse("{artist} - {title}.{ext}").unwrap();
+        assert_eq!(t.render(&v).unwrap(), vec!["Ahadadream - Bass Dhol.mp3"]);
+    }
+
+    #[test]
+    fn render_missing_artists_is_err() {
+        let mut v = vals();
+        v.artist = None;
+        let t = Template::parse("{artists}.{ext}").unwrap();
+        let err = t.render(&v).unwrap_err();
+        assert!(err.contains("artists"));
     }
 
     #[test]

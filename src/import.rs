@@ -165,6 +165,7 @@ fn classify_item(src: &Path, root: &Path, template: &Template, index: &mut Index
         .unwrap_or_default()
         .to_string();
     let vals = RenderValues {
+        primary_artist: meta.as_ref().and_then(|m| m.primary_artist.as_deref()),
         artist: meta.as_ref().and_then(|m| m.artist.as_deref()),
         title: meta.as_ref().and_then(|m| m.title.as_deref()),
         album: meta.as_ref().and_then(|m| m.album.as_deref()),
