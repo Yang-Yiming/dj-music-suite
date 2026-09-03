@@ -1,5 +1,7 @@
 mod convert;
+mod dedup;
 mod import;
+mod quality;
 mod reorg;
 mod scan;
 mod tags;
@@ -30,6 +32,8 @@ enum Commands {
     Import(import::ImportOpts),
     /// reorganize a music library folder on disk (analyze by default)
     Reorg(reorg::ReorgOpts),
+    /// find and remove duplicate files in a music library (analyze by default)
+    Dedup(dedup::DedupOpts),
 }
 
 fn main() {
@@ -55,6 +59,7 @@ fn main() {
         Some(Commands::Convert(opts)) => convert::cmd_convert(opts),
         Some(Commands::Import(opts)) => import::cmd_import(opts),
         Some(Commands::Reorg(opts)) => reorg::cmd_reorg(opts),
+        Some(Commands::Dedup(opts)) => dedup::cmd_dedup(opts),
         None => {
             let _ = Cli::command().print_help();
             0
