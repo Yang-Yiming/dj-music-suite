@@ -3,7 +3,7 @@ use std::sync::Arc;
 use axum::extract::{Multipart, Path as AxPath, State};
 use axum::http::{header, StatusCode};
 use axum::response::sse::{Event as SseEvent, KeepAlive, Sse};
-use axum::response::{Html, IntoResponse, Response};
+use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
 use axum::Router;
 use serde_json::json;
@@ -13,15 +13,17 @@ use dj_music_core::import::{self as core_import, Mode};
 
 use crate::state::{start_job, JobKind, JobStatus, AppState};
 
-const INDEX_HTML: &str = include_str!("../static/index.html");
-const APP_JS: &str = include_str!("../static/app.js");
-const STYLE_CSS: &str = include_str!("../static/style.css");
+/// Built frontend (crates/server/frontend/dist), embedded into release
+/// builds; debug builds read the folder live so a `bun run build` output is
+/// picked up on restart.
+#[derive(rust_embed::Embed)]
+#[folder = "frontend/dist"]
+struct Assets;
 
 pub fn router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/", get(index))
-        .route("/app.js", get(|| async { js(APP_JS) }))
-        .route("/style.css", get(|| async { css(STYLE_CSS) }))
+        .route("/assets/{*path}", get(asset))
         .route("/api/config", get(get_config).post(set_config))
         .route("/api/upload", post(upload))
         .route("/api/convert", post(start_convert))
@@ -34,24 +36,36 @@ pub fn router(state: Arc<AppState>) -> Router {
         .with_state(state)
 }
 
-async fn index() -> Html<&'static str> {
-    Html(INDEX_HTML)
+async fn index() -> Response {
+    match Assets::get("index.html") {
+        Some(file) => (
+            [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
+            file.data,
+        )
+            .into_response(),
+        None => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "frontend not built (run `just web`)",
+        )
+            .into_response(),
+    }
 }
 
-fn js(body: &'static str) -> Response {
-    (
-        [(header::CONTENT_TYPE, "application/javascript; charset=utf-8")],
-        body,
-    )
-        .into_response()
-}
-
-fn css(body: &'static str) -> Response {
-    (
-        [(header::CONTENT_TYPE, "text/css; charset=utf-8")],
-        body,
-    )
-        .into_response()
+async fn asset(axum::extract::Path(path): axum::extract::Path<String>) -> Response {
+    // the route strips the /assets prefix; the embed keys keep it
+    let key = format!("assets/{path}");
+    match Assets::get(&key) {
+        Some(file) => {
+            let mime = mime_guess::from_path(&key).first_or_octet_stream();
+            (
+                [(header::CONTENT_TYPE, mime.as_ref())],
+                [("cache-control", "public, max-age=3600")],
+                file.data,
+            )
+                .into_response()
+        }
+        None => (StatusCode::NOT_FOUND, "not found").into_response(),
+    }
 }
 
 fn bad_request(message: impl Into<String>) -> Response {
@@ -266,10 +280,21 @@ async fn import_execute(
         _ => Mode::Copy,
     };
     let overwrite = body.get("overwrite").and_then(|v| v.as_bool()).unwrap_or(false);
+    // per-item decisions from the preview table: only the listed files are
+    // placed; None (or missing) keeps the whole plan
+    let include: Option<Vec<String>> = body.get("include").and_then(|v| v.as_array()).map(|a| {
+        a.iter()
+            .filter_map(|x| x.as_str().map(str::to_string))
+            .collect()
+    });
     let plan = state.plans.lock().unwrap().get(&staging_id).cloned();
-    let Some(plan) = plan else {
+    let Some(mut plan) = plan else {
         return bad_request("请先运行导入分析");
     };
+    if let Some(include) = &include {
+        plan.items
+            .retain(|item| include.contains(&item.src.to_string_lossy().into_owned()));
+    }
 
     let result = start_job(&state, JobKind::ImportExecute, Some(staging_id), move |sink: dj_music_core::Sink| {
         let summary = core_import::execute(&plan, mode, overwrite, sink);

@@ -1,3 +1,5 @@
 test*
 target
 .DS_Store
+crates/server/frontend/node_modules
+crates/server/frontend/dist

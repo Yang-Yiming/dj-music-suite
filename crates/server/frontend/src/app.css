@@ -1,0 +1,10 @@
+@import "tailwindcss";
+
+:root {
+  font-family:
+    -apple-system, "PingFang SC", "Microsoft YaHei", "Segoe UI", sans-serif;
+}
+
+body {
+  @apply bg-slate-100 text-slate-900 text-sm antialiased;
+}

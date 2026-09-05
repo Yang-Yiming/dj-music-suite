@@ -96,7 +96,23 @@ The analysis classifies every file: `move` / `rename` / `move+rename`,
 artist + title). Only `move` entries execute by default; renames need
 `--allow-rename`; conflicts and untagged files are never touched.
 
-## serve
+## Building
+
+```bash
+just build   # bun build of the web bundle, then cargo build --release
+```
+
+Outputs two binaries in `target/release/`:
+
+- `dj-music-suite` — the CLI (no web stack; builds without bun entirely)
+- `dj-music-suite-web` — the web UI; frontend sources live in
+  `crates/server/frontend` (bun + Vite + Svelte + Tailwind), the built bundle
+  is embedded into the binary, so the web app still ships as one file
+
+`just dev-web` runs the frontend dev server with a proxy to a locally
+running `dj-music-suite-web` for UI iteration.
+
+## web ui
 
 A local web UI covering the two flows non-CLI users need: converting `.ncm`
 files and importing music into the library. Everything stays on the machine —
