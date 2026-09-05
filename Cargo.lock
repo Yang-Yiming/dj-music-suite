@@ -325,6 +325,7 @@ dependencies = [
 name = "dj-music-core"
 version = "0.1.0"
 dependencies = [
+ "dirs",
  "id3",
  "indicatif",
  "lofty",
@@ -333,6 +334,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "thiserror",
+ "toml",
  "walkdir",
 ]
 
@@ -341,13 +343,12 @@ name = "dj-music-server"
 version = "0.1.0"
 dependencies = [
  "axum",
- "dirs",
+ "clap",
  "dj-music-core",
  "serde",
  "serde_json",
  "tokio",
  "tokio-stream",
- "toml",
  "uuid",
 ]
 
@@ -357,7 +358,6 @@ version = "0.1.0"
 dependencies = [
  "clap",
  "dj-music-core",
- "dj-music-server",
  "indicatif",
 ]
 

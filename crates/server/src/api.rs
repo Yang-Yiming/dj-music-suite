@@ -97,7 +97,7 @@ async fn set_config(State(state): State<Arc<AppState>>, Json(body): Json<serde_j
     {
         let mut config = state.config.lock().unwrap();
         config.library_root = Some(canonical.clone());
-        if let Err(e) = crate::config::save(&state.paths.config_file, &config) {
+        if let Err(e) = dj_music_core::config::save(&state.paths.config_file, &config) {
             return bad_request(format!("保存配置失败: {e}"));
         }
     }
@@ -244,7 +244,7 @@ async fn import_analyze(
     let state2 = Arc::clone(&state);
     let sid = staging_id.clone();
     let result = start_job(&state, JobKind::ImportAnalyze, Some(staging_id), move |sink: dj_music_core::Sink| {
-        let plan = core_import::analyze(&dir, &root, &template, sink).map_err(|e| e.to_string())?;
+        let plan = core_import::analyze(&dir, Some(&root), &template, sink).map_err(|e| e.to_string())?;
         state2.plans.lock().unwrap().insert(sid, plan.clone());
         serde_json::to_value(&plan).map_err(|e| e.to_string())
     });

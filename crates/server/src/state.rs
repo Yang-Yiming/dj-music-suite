@@ -2,9 +2,8 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
+use dj_music_core::config::{self, Config, Paths};
 use dj_music_core::import::ImportPlan;
-
-use crate::config::{self, Config, Paths};
 
 /// One job at a time (the core operations take over whole staging dirs and
 /// the library index; parallel jobs would just fight each other).

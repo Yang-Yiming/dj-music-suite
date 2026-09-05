@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::env;
 use std::ffi::OsString;
 use std::path::PathBuf;
@@ -7,9 +8,7 @@ use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use indicatif::{ProgressBar, ProgressStyle};
 
 use dj_music_core::convert::ConvertOpts;
-use dj_music_core::dedup::DedupOpts;
 use dj_music_core::import::{self as core_import, Mode as CoreMode};
-use dj_music_core::reorg::ReorgOpts;
 use dj_music_core::{dedup as core_dedup, reorg as core_reorg, Event};
 
 #[derive(Parser)]
@@ -34,19 +33,6 @@ enum Commands {
     Reorg(ReorgArgs),
     /// find and remove duplicate files in a music library (analyze by default)
     Dedup(DedupArgs),
-    /// start the local web UI in the browser
-    Serve(ServeArgs),
-}
-
-#[derive(clap::Args)]
-struct ServeArgs {
-    /// port to listen on (127.0.0.1 only)
-    #[arg(long, value_name = "PORT", default_value_t = 8765)]
-    port: u16,
-
-    /// do not open the browser automatically
-    #[arg(long)]
-    no_open: bool,
 }
 
 #[derive(clap::Args)]
@@ -91,9 +77,10 @@ struct ImportArgs {
     #[arg(long, value_name = "DIR")]
     input: PathBuf,
 
-    /// music library root to import into
+    /// music library root to import into (default: the library root
+    /// configured in the web UI)
     #[arg(long, value_name = "DIR")]
-    root: PathBuf,
+    root: Option<PathBuf>,
 
     /// destination layout relative to the root; placeholders: {artist},
     /// {title}, {album}, {filename} (original name), {ext}
@@ -131,8 +118,9 @@ impl From<ModeArg> for CoreMode {
 
 #[derive(clap::Args)]
 struct ReorgArgs {
-    /// music library folder to reorganize
-    #[arg(long, value_name = "DIR", required_unless_present = "from")]
+    /// music library folder to reorganize (default: the library root
+    /// configured in the web UI)
+    #[arg(long, value_name = "DIR")]
     root: Option<PathBuf>,
 
     /// destination layout relative to the root; placeholders: {artist},
@@ -160,8 +148,9 @@ struct ReorgArgs {
 
 #[derive(clap::Args)]
 struct DedupArgs {
-    /// music library folder to deduplicate
-    #[arg(long, value_name = "DIR", required_unless_present = "from")]
+    /// music library folder to deduplicate (default: the library root
+    /// configured in the web UI)
+    #[arg(long, value_name = "DIR")]
     root: Option<PathBuf>,
 
     /// actually move/delete the duplicate files (default: analyze only and
@@ -279,9 +268,8 @@ fn main() {
     let code = match cli.command {
         Some(Commands::Convert(args)) => cmd_convert(args, &sink),
         Some(Commands::Import(args)) => cmd_import(args, &sink),
-        Some(Commands::Reorg(args)) => cmd_reorg(args),
-        Some(Commands::Dedup(args)) => cmd_dedup(args),
-        Some(Commands::Serve(args)) => cmd_serve(args),
+        Some(Commands::Reorg(args)) => cmd_reorg(args, &sink),
+        Some(Commands::Dedup(args)) => cmd_dedup(args, &sink),
         None => {
             let _ = Cli::command().print_help();
             0
@@ -316,7 +304,9 @@ fn cmd_convert(args: ConvertArgs, sink: &TerminalSink) -> i32 {
 
 fn cmd_import(args: ImportArgs, sink: &TerminalSink) -> i32 {
     let mode: CoreMode = args.mode.into();
-    let plan = match core_import::analyze(&args.input, &args.root, &args.template, &|e: &Event| sink.sink(e)) {
+    let sink_fn = |e: &Event| sink.sink(e);
+    let plan = match core_import::analyze(&args.input, args.root.as_deref(), &args.template, &sink_fn)
+    {
         Ok(p) => p,
         Err(e) => return error_code(e),
     };
@@ -335,39 +325,219 @@ fn cmd_import(args: ImportArgs, sink: &TerminalSink) -> i32 {
     }
 }
 
-fn cmd_reorg(args: ReorgArgs) -> i32 {
-    core_reorg::run(ReorgOpts {
+fn cmd_reorg(args: ReorgArgs, sink: &TerminalSink) -> i32 {
+    if args.from.is_some() && !args.execute {
+        eprintln!("--from only makes sense together with --execute");
+        return 2;
+    }
+    let opts = core_reorg::ReorgOpts {
         root: args.root,
         template: args.template,
         execute: args.execute,
         from: args.from,
         allow_rename: args.allow_rename,
-        plan: args.plan,
-    })
+        plan: Some(args.plan),
+    };
+    let sink_fn = |e: &Event| sink.sink(e);
+    if !args.execute {
+        match core_reorg::analyze(&opts, &sink_fn) {
+            Ok(plan) => {
+                sink.finish();
+                print_reorg_report(&plan);
+                0
+            }
+            Err(e) => error_code(e),
+        }
+    } else {
+        match core_reorg::execute(&opts, &sink_fn) {
+            Ok(summary) => {
+                sink.finish();
+                println!(
+                    "done: {} moved ({} renamed), {} skipped, {} renames deferred, {} failed",
+                    summary.moved, summary.renamed, summary.skipped, summary.deferred_renames,
+                    summary.failed
+                );
+                println!();
+                println!("next step in rekordbox:");
+                println!("  File -> Display All Missing Files -> select all -> Relocate ->");
+                println!("  point it at {}", summary.root.display());
+                if summary.renamed > 0 {
+                    println!(
+                        "  rekordbox matches relocated files by filename: relink the {}",
+                        summary.renamed
+                    );
+                    println!("  renamed file(s) by hand.");
+                }
+                i32::from(summary.failed > 0)
+            }
+            Err(e) => error_code(e),
+        }
+    }
 }
 
-fn cmd_dedup(args: DedupArgs) -> i32 {
-    core_dedup::run(DedupOpts {
+fn print_reorg_report(plan: &core_reorg::Plan) {
+    let mut counts: BTreeMap<&str, usize> = BTreeMap::new();
+    for e in &plan.entries {
+        // ready entries are grouped by their op (move/rename/move+rename),
+        // everything else by its status
+        let key = if e.status == "ready" {
+            e.op.as_str()
+        } else {
+            e.status.as_str()
+        };
+        *counts.entry(key).or_default() += 1;
+    }
+    println!("reorg analysis");
+    println!("  root: {}", plan.root.display());
+    println!("  template: {}", plan.template);
+    println!();
+    for (status, label) in [
+        ("move", "move"),
+        ("rename", "rename"),
+        ("move+rename", "move+rename"),
+        ("in-place", "in place"),
+        ("conflict", "conflict"),
+        ("untagged", "untagged"),
+    ] {
+        let n = counts.get(status).copied().unwrap_or(0);
+        if n > 0 {
+            println!("  {label:<12} {n}");
+        }
+    }
+    if counts.is_empty() {
+        println!("  (no audio files found)");
+    }
+    let renames = counts.get("rename").copied().unwrap_or(0)
+        + counts.get("move+rename").copied().unwrap_or(0);
+    if renames > 0 {
+        println!();
+        println!("  note: {renames} file(s) would be RENAMED. rekordbox relocates files by");
+        println!("  filename, so renames are skipped unless --allow-rename (then they");
+        println!("  must be relinked by hand in rekordbox).");
+    }
+    if !plan.duplicates.is_empty() {
+        println!();
+        println!("possible duplicates (same normalized artist + title):");
+        for g in &plan.duplicates {
+            println!("  {} / {} ({} files)", g.artist, g.title, g.files.len());
+            for f in &g.files {
+                let dur = f
+                    .duration_secs
+                    .map(|s| format!(" ({}:{:02})", s / 60, s % 60))
+                    .unwrap_or_default();
+                let size = f
+                    .size
+                    .map(|b| format!(", {:.1} MB", b as f64 / (1024.0 * 1024.0)))
+                    .unwrap_or_default();
+                println!("    - {}{}{}", f.path.display(), dur, size);
+            }
+        }
+    }
+}
+
+fn cmd_dedup(args: DedupArgs, sink: &TerminalSink) -> i32 {
+    if args.from.is_some() && !args.execute {
+        eprintln!("--from only makes sense together with --execute");
+        return 2;
+    }
+    let opts = core_dedup::DedupOpts {
         root: args.root,
         execute: args.execute,
         from: args.from,
         keep: args.keep.into(),
         trash: args.trash,
         delete: args.delete,
-        plan: args.plan,
-    })
+        plan: Some(args.plan),
+    };
+    let sink_fn = |e: &Event| sink.sink(e);
+    if !args.execute {
+        match core_dedup::analyze(&opts, &sink_fn) {
+            Ok((plan, stats)) => {
+                sink.finish();
+                print_dedup_report(&plan.groups, stats.unreadable, stats.scanned);
+                0
+            }
+            Err(e) => error_code(e),
+        }
+    } else {
+        match core_dedup::execute(&opts, &sink_fn) {
+            Ok(summary) => {
+                sink.finish();
+                let freed_mb = summary.freed_bytes as f64 / (1024.0 * 1024.0);
+                println!(
+                    "done: {} duplicates removed ({freed_mb:.1} MB freed), {} skipped, {} failed",
+                    summary.removed, summary.skipped, summary.failed
+                );
+                if !args.delete && summary.removed > 0 {
+                    let trash = match opts.trash {
+                        Some(t) => t,
+                        None => summary.root.join(".dedup-trash"),
+                    };
+                    println!("duplicates were moved to {}", trash.display());
+                    println!("verify in your player, then delete the trash folder.");
+                }
+                i32::from(summary.failed > 0)
+            }
+            Err(e) => error_code(e),
+        }
+    }
 }
 
-fn cmd_serve(args: ServeArgs) -> i32 {
-    match dj_music_server::serve(dj_music_server::ServeOpts {
-        port: args.port,
-        open_browser: !args.no_open,
-    }) {
-        Ok(()) => 0,
-        Err(e) => {
-            eprintln!("{e}");
-            1
+fn describe(score: &core_dedup::ScoreDetail) -> String {
+    let mut parts = vec![format!("{}kbps", score.bitrate.unwrap_or(0))];
+    if let Some(sr) = score.sample_rate {
+        parts.push(format!("{sr}Hz"));
+    }
+    if score.has_cover {
+        parts.push("cover".into());
+    }
+    if score.has_lyrics {
+        parts.push("lyrics".into());
+    }
+    if !score.tags_complete {
+        parts.push("incomplete-tags".into());
+    }
+    format!("score {} ({})", score.score, parts.join(", "))
+}
+
+fn print_dedup_report(
+    groups: &[core_dedup::Group],
+    unreadable: usize,
+    scanned: usize,
+) {
+    let mut counts: BTreeMap<&str, usize> = BTreeMap::new();
+    let mut freed = 0u64;
+    for g in groups {
+        *counts.entry(g.kind.as_str()).or_default() += 1;
+        freed += g.losers.iter().map(|l| l.size).sum::<u64>();
+    }
+    let freed_mb = freed as f64 / (1024.0 * 1024.0);
+    println!(
+        "scanned {scanned} files ({} unreadable ignored), {} duplicate groups, \
+         up to {freed_mb:.1} MB reclaimable",
+        if unreadable > 0 { unreadable.to_string() } else { "no".into() },
+        groups.len()
+    );
+    for (kind, label) in [("identical", "identical"), ("same-identity", "same-identity")] {
+        let n = counts.get(kind).copied().unwrap_or(0);
+        if n > 0 {
+            println!("  {label:<14} {n}");
         }
+    }
+    println!();
+    for g in groups {
+        match (&g.identity, g.kind.as_str()) {
+            (Some((artist, title)), _) => println!("[{}] {} / {}", g.kind, artist, title),
+            (None, _) => println!("[{}]", g.kind),
+        }
+        println!("  keep {}  {}", g.keep.path.display(), describe(&g.keep.score));
+        for l in &g.losers {
+            println!("  lose {}  {}", l.path.display(), describe(&l.score));
+        }
+    }
+    if !groups.is_empty() {
+        println!();
+        println!("run with --execute to move the losers into .dedup-trash/ (or --delete to remove them).");
     }
 }
 

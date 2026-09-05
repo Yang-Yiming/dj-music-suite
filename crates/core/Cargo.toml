@@ -12,6 +12,8 @@ walkdir = "2.5.0"
 lofty = "0.25.1"
 serde = { version = "1.0.229", features = ["derive"] }
 thiserror = "2"
+dirs = "6"
+toml = "0.9"
 # reorg/dedup still render their own terminal progress bars; they move to the
 # event sink along with convert/import when they get a web UI
 indicatif = "0.18.6"

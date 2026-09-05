@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use crate::config;
 use crate::scan::{file_name, scan_audio};
 use crate::tags;
 use crate::template::{RenderValues, Template};
@@ -73,8 +74,14 @@ struct LibEntry {
 type Index = BTreeMap<(String, String), Vec<LibEntry>>;
 
 /// Index the library and classify every new file against it. The returned
-/// plan is purely informational until [`execute`] is called on it.
-pub fn analyze(input: &Path, root: &Path, template_str: &str, sink: Sink) -> Result<ImportPlan> {
+/// plan is purely informational until [`execute`] is called on it. `root`
+/// falls back to the configured library root when omitted.
+pub fn analyze(
+    input: &Path,
+    root: Option<&Path>,
+    template_str: &str,
+    sink: Sink,
+) -> Result<ImportPlan> {
     let input = match fs::canonicalize(input) {
         Ok(p) if p.is_dir() => p,
         Ok(_) => return Err(usage(format!("input is not a directory: {}", input.display()))),
@@ -82,11 +89,7 @@ pub fn analyze(input: &Path, root: &Path, template_str: &str, sink: Sink) -> Res
             return Err(usage(format!("cannot resolve input {}: {e}", input.display())))
         }
     };
-    let root = match fs::canonicalize(root) {
-        Ok(p) if p.is_dir() => p,
-        Ok(_) => return Err(usage(format!("root is not a directory: {}", root.display()))),
-        Err(e) => return Err(usage(format!("cannot resolve root {}: {e}", root.display()))),
-    };
+    let root = config::resolve_library_root(root)?;
     let template =
         Template::parse(template_str).map_err(|e| usage(format!("bad --template: {e}")))?;
 

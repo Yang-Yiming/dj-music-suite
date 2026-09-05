@@ -5,6 +5,7 @@
 //! codes. The CLI (and later the web server) maps these onto terminals,
 //! browsers or exit codes.
 
+pub mod config;
 pub mod convert;
 pub mod dedup;
 pub mod import;

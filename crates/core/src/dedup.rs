@@ -6,9 +6,11 @@ use std::time::UNIX_EPOCH;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use crate::config;
 use crate::quality;
 use crate::scan::{file_name, scan_audio};
 use crate::tags;
+use crate::{usage, Event, Result, Sink};
 
 /// same artist + title with durations within this delta counts as one song
 const DURATION_TOLERANCE_SECS: u64 = 2;
@@ -20,7 +22,9 @@ pub struct DedupOpts {
     pub keep: KeepMode,
     pub trash: Option<PathBuf>,
     pub delete: bool,
-    pub plan: PathBuf,
+    /// plan json written by the analysis; also seeds the hash/score cache
+    /// (None: don't read or write a plan file, e.g. web)
+    pub plan: Option<PathBuf>,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -60,90 +64,78 @@ impl From<&quality::Quality> for ScoreDetail {
 }
 
 #[derive(Serialize, Deserialize, Clone)]
-struct FileEntry {
-    path: PathBuf,
-    size: u64,
-    mtime_secs: u64,
-    sha256: String,
-    score: ScoreDetail,
+pub struct FileEntry {
+    pub path: PathBuf,
+    pub size: u64,
+    pub mtime_secs: u64,
+    pub sha256: String,
+    pub score: ScoreDetail,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    duration_secs: Option<u64>,
+    pub duration_secs: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    identity: Option<(String, String)>,
+    pub identity: Option<(String, String)>,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
-struct CachedFile {
-    mtime_secs: u64,
-    size: u64,
-    sha256: String,
-    score: ScoreDetail,
+pub struct CachedFile {
+    pub mtime_secs: u64,
+    pub size: u64,
+    pub sha256: String,
+    pub score: ScoreDetail,
 }
 
 #[derive(Serialize, Deserialize)]
-struct Group {
+pub struct Group {
     /// "identical" (same content hash) or "same-identity" (same normalized
     /// artist + title within the duration tolerance)
-    kind: String,
+    pub kind: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    identity: Option<(String, String)>,
-    keep: FileEntry,
-    losers: Vec<FileEntry>,
+    pub identity: Option<(String, String)>,
+    pub keep: FileEntry,
+    pub losers: Vec<FileEntry>,
 }
 
 #[derive(Serialize, Deserialize)]
-struct Plan {
-    root: PathBuf,
-    groups: Vec<Group>,
+pub struct Plan {
+    pub root: PathBuf,
+    pub groups: Vec<Group>,
     /// hash/score cache keyed by path, valid while mtime + size are unchanged
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    cache: BTreeMap<String, CachedFile>,
+    pub cache: BTreeMap<String, CachedFile>,
 }
 
-/// Run the dedup command: prints its own report/progress and returns the CLI
-/// exit code. (Not yet migrated to the event sink; see lib.rs.)
-pub fn run(opts: DedupOpts) -> i32 {
-    if opts.from.is_some() && !opts.execute {
-        eprintln!("--from only makes sense together with --execute");
-        return 2;
-    }
-    if opts.execute {
-        execute(opts)
-    } else {
-        analyze(opts)
-    }
+/// What the analysis scanned (for the report header).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DedupStats {
+    pub scanned: usize,
+    pub unreadable: usize,
 }
 
-fn resolve_root(root: Option<&Path>) -> Option<PathBuf> {
-    match root.map(fs::canonicalize) {
-        Some(Ok(p)) if p.is_dir() => Some(p),
-        Some(Ok(_)) => {
-            eprintln!("root is not a directory: {}", root.unwrap().display());
-            None
-        }
-        Some(Err(e)) => {
-            eprintln!("cannot resolve root {}: {e}", root.unwrap().display());
-            None
-        }
-        None => None,
-    }
+/// Outcome of applying a dedup plan.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DedupSummary {
+    pub root: PathBuf,
+    pub removed: usize,
+    pub skipped: usize,
+    pub failed: usize,
+    pub freed_bytes: u64,
 }
 
-fn analyze(opts: DedupOpts) -> i32 {
-    let Some(root) = resolve_root(opts.root.as_deref()) else {
-        return 2;
-    };
+/// Measure every file, group the duplicates and optionally write the plan
+/// json (which also seeds the next run's hash/score cache).
+pub fn analyze(opts: &DedupOpts, sink: Sink) -> Result<(Plan, DedupStats)> {
+    let root = config::resolve_library_root(opts.root.as_deref())?;
     let trash_dir = opts
         .trash
         .clone()
         .unwrap_or_else(|| root.join(".dedup-trash"));
-    let mut cache = load_cache(&opts.plan);
+    let mut cache = load_cache(opts.plan.as_deref());
 
     let files: Vec<PathBuf> = scan_audio(&root)
         .into_iter()
         .filter(|p| !p.starts_with(&trash_dir))
         .collect();
-    let pb = progress_bar(files.len() as u64);
+    sink(&Event::Start(files.len() as u64));
     let mut entries = Vec::new();
     let mut unreadable = 0usize;
     for path in &files {
@@ -151,53 +143,63 @@ fn analyze(opts: DedupOpts) -> i32 {
             Some(e) => entries.push(e),
             None => {
                 unreadable += 1;
-                pb.println(format!("[warn] cannot read, ignored: {}", path.display()));
+                sink(&Event::Warn(format!(
+                    "[warn] cannot read, ignored: {}",
+                    path.display()
+                )));
             }
         }
-        pb.inc(1);
+        sink(&Event::Step(file_name(path)));
     }
-    pb.finish_and_clear();
 
     let groups = build_groups(entries, opts.keep);
-    print_report(&groups, unreadable, files.len());
-    write_plan(
-        &Plan {
-            root,
-            groups,
-            cache,
+    let plan = Plan {
+        root,
+        groups,
+        cache,
+    };
+    if let Some(plan_path) = &opts.plan {
+        write_plan(&plan, plan_path, sink);
+    }
+    Ok((
+        plan,
+        DedupStats {
+            scanned: files.len(),
+            unreadable,
         },
-        &opts.plan,
-    );
-    0
+    ))
 }
 
-fn execute(opts: DedupOpts) -> i32 {
+/// Read back a plan json written by [`analyze`].
+pub fn load_plan(path: &Path) -> Result<Plan> {
+    let raw = fs::read_to_string(path)
+        .map_err(|e| usage(format!("cannot read plan {}: {e}", path.display())))?;
+    serde_json::from_str(&raw).map_err(|e| usage(format!("bad plan file {}: {e}", path.display())))
+}
+
+/// Remove the losers of every group (freshly analyzed or loaded plan). Never
+/// touches a group whose keeper is gone. Losers are deleted or moved into the
+/// trash folder, depending on `delete`.
+pub fn execute(opts: &DedupOpts, sink: Sink) -> Result<DedupSummary> {
     let plan = if let Some(from) = &opts.from {
-        let raw = match fs::read_to_string(from) {
-            Ok(r) => r,
-            Err(e) => {
-                eprintln!("cannot read plan {}: {e}", from.display());
-                return 2;
-            }
-        };
-        match serde_json::from_str(&raw) {
-            Ok(p) => p,
-            Err(e) => {
-                eprintln!("bad plan file {}: {e}", from.display());
-                return 2;
-            }
-        }
+        load_plan(from)?
     } else {
-        let Some(root) = resolve_root(opts.root.as_deref()) else {
-            return 2;
-        };
-        let mut cache = load_cache(&opts.plan);
+        let root = config::resolve_library_root(opts.root.as_deref())?;
         let trash_dir = opts.trash.clone().unwrap_or_else(|| root.join(".dedup-trash"));
+        let mut cache = load_cache(opts.plan.as_deref());
         let files: Vec<PathBuf> = scan_audio(&root)
             .into_iter()
             .filter(|p| !p.starts_with(&trash_dir))
             .collect();
-        let entries: Vec<FileEntry> = files.iter().filter_map(|p| measure(p, &mut cache)).collect();
+        sink(&Event::Start(files.len() as u64));
+        let entries: Vec<FileEntry> = files
+            .iter()
+            .filter_map(|p| {
+                let e = measure(p, &mut cache);
+                sink(&Event::Step(file_name(p)));
+                e
+            })
+            .collect();
         let groups = build_groups(entries, opts.keep);
         Plan {
             root,
@@ -210,7 +212,7 @@ fn execute(opts: DedupOpts) -> i32 {
         .trash
         .clone()
         .unwrap_or_else(|| plan.root.join(".dedup-trash"));
-    let pb = progress_bar(plan.groups.len() as u64);
+    sink(&Event::Start(plan.groups.len() as u64));
     let mut removed = 0usize;
     let mut skipped = 0usize;
     let mut failed = 0usize;
@@ -219,52 +221,65 @@ fn execute(opts: DedupOpts) -> i32 {
         // never touch the losers when the keeper is missing: the group might
         // be the only surviving copy of the song
         if !group.keep.path.is_file() {
-            pb.println(format!(
+            sink(&Event::Line(format!(
                 "[skip] keeper is gone, group left untouched: {}",
                 group.keep.path.display()
-            ));
+            )));
             skipped += group.losers.len();
-            pb.inc(1);
+            sink(&Event::Step(String::new()));
             continue;
         }
         for loser in &group.losers {
             if !loser.path.is_file() {
-                pb.println(format!("[skip] source is gone: {}", loser.path.display()));
+                sink(&Event::Line(format!("[skip] source is gone: {}", loser.path.display())));
                 skipped += 1;
                 continue;
             }
             let res = if opts.delete {
                 fs::remove_file(&loser.path).map(|_| "deleted".to_string())
             } else {
-                move_to_trash(&loser.path, &trash, &group.kind).map(|p| format!("-> {}", p.display()))
+                move_to_trash(&loser.path, &trash, &group.kind)
+                    .map(|p| format!("-> {}", p.display()))
             };
             match res {
                 Ok(msg) => {
                     removed += 1;
                     freed += loser.size;
-                    pb.println(format!("[ok] {} {}: {}", msg, group.kind, loser.path.display()));
+                    sink(&Event::Line(format!(
+                        "[ok] {} {}: {}",
+                        msg, group.kind, loser.path.display()
+                    )));
                 }
                 Err(e) => {
-                    pb.println(format!("[fail] {}: {e}", loser.path.display()));
+                    sink(&Event::Line(format!("[fail] {}: {e}", loser.path.display())));
                     failed += 1;
                 }
             }
         }
-        pb.inc(1);
+        sink(&Event::Step(file_name(&group.keep.path)));
     }
-    pb.finish_and_clear();
-    let freed_mb = freed as f64 / (1024.0 * 1024.0);
-    println!(
-        "done: {removed} duplicates removed ({freed_mb:.1} MB freed), {skipped} skipped, {failed} failed"
-    );
-    if !opts.delete && removed > 0 {
-        println!("duplicates were moved to {}", trash.display());
-        println!("verify in your player, then delete the trash folder.");
-    }
-    if failed > 0 {
-        1
-    } else {
-        0
+    Ok(DedupSummary {
+        root: plan.root,
+        removed,
+        skipped,
+        failed,
+        freed_bytes: freed,
+    })
+}
+
+fn write_plan(plan: &Plan, plan_path: &Path, sink: Sink) {
+    match serde_json::to_string_pretty(plan) {
+        Ok(json) => {
+            if let Err(e) = fs::write(plan_path, json + "\n") {
+                sink(&Event::Warn(format!(
+                    "[warn] cannot write plan {}: {e}",
+                    plan_path.display()
+                )));
+            } else {
+                sink(&Event::Line(format!("plan written to {}", plan_path.display())));
+            }
+        }
+        Err(e) => sink(&Event::Warn(format!("[warn] cannot serialize plan: {e}"))),
     }
 }
 
@@ -368,25 +383,12 @@ fn sha256_file(path: &Path) -> std::io::Result<String> {
     Ok(format!("{:x}", hasher.finalize()))
 }
 
-fn load_cache(plan_path: &Path) -> BTreeMap<String, CachedFile> {
-    fs::read_to_string(plan_path)
-        .ok()
+fn load_cache(plan_path: Option<&Path>) -> BTreeMap<String, CachedFile> {
+    plan_path
+        .and_then(|p| fs::read_to_string(p).ok())
         .and_then(|raw| serde_json::from_str::<Plan>(&raw).ok())
         .map(|p| p.cache)
         .unwrap_or_default()
-}
-
-fn write_plan(plan: &Plan, plan_path: &Path) {
-    match serde_json::to_string_pretty(plan) {
-        Ok(json) => {
-            if let Err(e) = fs::write(plan_path, json + "\n") {
-                eprintln!("[warn] cannot write plan {}: {e}", plan_path.display());
-            } else {
-                println!("plan written to {}", plan_path.display());
-            }
-        }
-        Err(e) => eprintln!("[warn] cannot serialize plan: {e}"),
-    }
 }
 
 fn build_groups(entries: Vec<FileEntry>, keep: KeepMode) -> Vec<Group> {
@@ -481,70 +483,6 @@ fn make_group(kind: &str, identity: Option<(String, String)>, bucket: Vec<FileEn
     }
 }
 
-fn describe(score: &ScoreDetail) -> String {
-    let mut parts = vec![format!("{}kbps", score.bitrate.unwrap_or(0))];
-    if let Some(sr) = score.sample_rate {
-        parts.push(format!("{sr}Hz"));
-    }
-    if score.has_cover {
-        parts.push("cover".into());
-    }
-    if score.has_lyrics {
-        parts.push("lyrics".into());
-    }
-    if !score.tags_complete {
-        parts.push("incomplete-tags".into());
-    }
-    format!("score {} ({})", score.score, parts.join(", "))
-}
-
-fn print_report(groups: &[Group], unreadable: usize, scanned: usize) {
-    let mut counts: BTreeMap<&str, usize> = BTreeMap::new();
-    let mut freed = 0u64;
-    for g in groups {
-        *counts.entry(g.kind.as_str()).or_default() += 1;
-        freed += g.losers.iter().map(|l| l.size).sum::<u64>();
-    }
-    let freed_mb = freed as f64 / (1024.0 * 1024.0);
-    println!(
-        "scanned {scanned} files ({} unreadable ignored), {} duplicate groups, \
-         up to {freed_mb:.1} MB reclaimable",
-        if unreadable > 0 { unreadable.to_string() } else { "no".into() },
-        groups.len()
-    );
-    for (kind, label) in [("identical", "identical"), ("same-identity", "same-identity")] {
-        let n = counts.get(kind).copied().unwrap_or(0);
-        if n > 0 {
-            println!("  {label:<14} {n}");
-        }
-    }
-    println!();
-    for g in groups {
-        match (&g.identity, g.kind.as_str()) {
-            (Some((artist, title)), _) => println!("[{}] {} / {}", g.kind, artist, title),
-            (None, _) => println!("[{}]", g.kind),
-        }
-        println!("  keep {}  {}", g.keep.path.display(), describe(&g.keep.score));
-        for l in &g.losers {
-            println!("  lose {}  {}", l.path.display(), describe(&l.score));
-        }
-    }
-    if !groups.is_empty() {
-        println!();
-        println!("run with --execute to move the losers into .dedup-trash/ (or --delete to remove them).");
-    }
-}
-
-fn progress_bar(len: u64) -> indicatif::ProgressBar {
-    let pb = indicatif::ProgressBar::new(len);
-    if let Ok(style) = indicatif::ProgressStyle::with_template(
-        "{spinner:.green} [{elapsed_precise}] [{bar:32.cyan/blue}] {pos}/{len} {msg}",
-    ) {
-        pb.set_style(style.progress_chars("\u{2588}\u{2592}\u{2591}"));
-    }
-    pb
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -557,7 +495,9 @@ mod tests {
         ));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
-        dir
+        // analyze() canonicalizes the root; match that so path comparisons
+        // in the tests line up (/var -> /private/var on macOS)
+        fs::canonicalize(&dir).unwrap_or(dir)
     }
 
     /// `frames` MPEG frames -> distinct, stable durations (100 frames ~ 2s,
@@ -585,13 +525,20 @@ mod tests {
         tag.write_to_path(path, id3::Version::Id3v24).unwrap();
     }
 
+    fn no_sink(_: &Event) {}
+
     fn collect(root: &Path, keep: KeepMode) -> Vec<Group> {
-        let mut cache = BTreeMap::new();
-        let entries: Vec<FileEntry> = scan_audio(root)
-            .iter()
-            .filter_map(|p| measure(p, &mut cache))
-            .collect();
-        build_groups(entries, keep)
+        let opts = DedupOpts {
+            root: Some(root.to_path_buf()),
+            execute: false,
+            from: None,
+            keep,
+            trash: None,
+            delete: false,
+            plan: None,
+        };
+        let (plan, _stats) = analyze(&opts, &no_sink).unwrap();
+        plan.groups
     }
 
     fn find<'a>(groups: &'a [Group], path: &Path) -> &'a Group {
@@ -601,6 +548,18 @@ mod tests {
                 g.keep.path == path || g.losers.iter().any(|l| l.path == path)
             })
             .unwrap()
+    }
+
+    fn exec_opts(root: &Path, delete: bool) -> DedupOpts {
+        DedupOpts {
+            root: Some(root.to_path_buf()),
+            execute: true,
+            from: None,
+            keep: KeepMode::Best,
+            trash: None,
+            delete,
+            plan: None,
+        }
     }
 
     #[test]
@@ -678,15 +637,8 @@ mod tests {
         write_tagged(&root.join("a.mp3"), "A", "T", 100);
         write_tagged(&root.join("b.mp3"), "A", "T", 101);
 
-        let groups = collect(&root, KeepMode::Best);
-        let plan = Plan {
-            root: root.clone(),
-            groups,
-            cache: BTreeMap::new(),
-        };
-        // trash mode
-        let code = run_execute(&plan, None, false);
-        assert_eq!(code, 0);
+        let summary = execute(&exec_opts(&root, false), &no_sink).unwrap();
+        assert_eq!(summary.failed, 0);
         assert!(root.join("a.mp3").is_file() || root.join("b.mp3").is_file());
         let kept = if root.join("a.mp3").is_file() {
             root.join("a.mp3")
@@ -705,19 +657,15 @@ mod tests {
             .join(lost.file_name().unwrap())
             .is_file());
         assert!(kept.is_file());
+        assert_eq!(summary.removed, 1);
+        assert!(summary.freed_bytes > 0);
 
         // delete mode on a fresh library
         let root2 = tmpdir("exec-del");
         write_tagged(&root2.join("a.mp3"), "A", "T", 100);
         write_tagged(&root2.join("b.mp3"), "A", "T", 101);
-        let groups = collect(&root2, KeepMode::Best);
-        let plan2 = Plan {
-            root: root2.clone(),
-            groups,
-            cache: BTreeMap::new(),
-        };
-        let code = run_execute(&plan2, None, true);
-        assert_eq!(code, 0);
+        let summary = execute(&exec_opts(&root2, true), &no_sink).unwrap();
+        assert_eq!(summary.failed, 0);
         let remaining = scan_audio(&root2);
         assert_eq!(remaining.len(), 1);
         assert!(!root2.join(".dedup-trash").exists());
@@ -730,49 +678,24 @@ mod tests {
         let root = tmpdir("gone");
         write_tagged(&root.join("a.mp3"), "A", "T", 100);
         write_tagged(&root.join("b.mp3"), "A", "T", 101);
-        let groups = collect(&root, KeepMode::Best);
-        // pretend the keeper was deleted after the analysis
-        let plan = Plan {
-            root: root.clone(),
-            groups,
-            cache: BTreeMap::new(),
-        };
-        for loser in &plan.groups[0].losers.clone() {
+        // analyze + write the plan, then simulate the keeper disappearing:
+        // deleting the losers of the analyzed group leaves only the keeper
+        let plan_path = root.join(".plan.json");
+        let mut opts = exec_opts(&root, true);
+        opts.execute = false;
+        opts.plan = Some(plan_path.clone());
+        let (plan, _) = analyze(&opts, &no_sink).unwrap();
+        for loser in &plan.groups[0].losers {
             let _ = fs::remove_file(&loser.path);
         }
         let before: Vec<PathBuf> = scan_audio(&root);
-        let code = run_execute(&plan, None, true);
-        assert_eq!(code, 0);
+        let mut exec = exec_opts(&root, true);
+        exec.from = Some(plan_path);
+        let summary = execute(&exec, &no_sink).unwrap();
+        assert_eq!(summary.failed, 0);
+        assert_eq!(summary.skipped, 1);
         let after: Vec<PathBuf> = scan_audio(&root);
         assert_eq!(before, after, "nothing must be deleted without the keeper");
-        drop(plan);
         fs::remove_dir_all(&root).unwrap();
-    }
-
-    fn run_execute(plan: &Plan, trash: Option<&Path>, delete: bool) -> i32 {
-        // mirror execute()'s per-group behavior against a borrowed plan
-        let trash = trash
-            .map(PathBuf::from)
-            .unwrap_or_else(|| plan.root.join(".dedup-trash"));
-        let mut failed = 0usize;
-        for group in &plan.groups {
-            if !group.keep.path.is_file() {
-                continue;
-            }
-            for loser in &group.losers {
-                if !loser.path.is_file() {
-                    continue;
-                }
-                let res = if delete {
-                    fs::remove_file(&loser.path).map(|_| PathBuf::new())
-                } else {
-                    move_to_trash(&loser.path, &trash, &group.kind)
-                };
-                if res.is_err() {
-                    failed += 1;
-                }
-            }
-        }
-        i32::from(failed > 0)
     }
 }

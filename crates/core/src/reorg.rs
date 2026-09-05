@@ -2,12 +2,13 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use indicatif::{ProgressBar, ProgressStyle};
 use serde::{Deserialize, Serialize};
 
+use crate::config;
 use crate::scan::{file_name, scan_audio};
 use crate::tags::{self, TrackMeta};
 use crate::template::{RenderValues, Template};
+use crate::{usage, Event, Result, Sink};
 
 pub struct ReorgOpts {
     pub root: Option<PathBuf>,
@@ -15,131 +16,97 @@ pub struct ReorgOpts {
     pub execute: bool,
     pub from: Option<PathBuf>,
     pub allow_rename: bool,
-    pub plan: PathBuf,
+    /// plan json written by the analysis (None: don't write a file, e.g. web)
+    pub plan: Option<PathBuf>,
 }
 
 #[derive(Serialize, Deserialize)]
-struct PlanEntry {
-    src: PathBuf,
-    dst: Option<PathBuf>,
+pub struct PlanEntry {
+    pub src: PathBuf,
+    pub dst: Option<PathBuf>,
     /// "move", "rename" or "move+rename" ("none" for skipped entries)
-    op: String,
+    pub op: String,
     /// "ready", "in-place", "conflict" or "untagged"
-    status: String,
+    pub status: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    note: Option<String>,
+    pub note: Option<String>,
 }
 
 #[derive(Serialize, Deserialize)]
-struct DupeFile {
-    path: PathBuf,
+pub struct DupeFile {
+    pub path: PathBuf,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    duration_secs: Option<u64>,
+    pub duration_secs: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    size: Option<u64>,
+    pub size: Option<u64>,
 }
 
 #[derive(Serialize, Deserialize)]
-struct DupeGroup {
-    artist: String,
-    title: String,
-    files: Vec<DupeFile>,
+pub struct DupeGroup {
+    pub artist: String,
+    pub title: String,
+    pub files: Vec<DupeFile>,
 }
 
 #[derive(Serialize, Deserialize)]
-struct Plan {
-    root: PathBuf,
-    template: String,
-    entries: Vec<PlanEntry>,
+pub struct Plan {
+    pub root: PathBuf,
+    pub template: String,
+    pub entries: Vec<PlanEntry>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    duplicates: Vec<DupeGroup>,
+    pub duplicates: Vec<DupeGroup>,
 }
 
-/// Run the reorg command: prints its own report/progress and returns the CLI
-/// exit code. (Not yet migrated to the event sink; see lib.rs.)
-pub fn run(opts: ReorgOpts) -> i32 {
-    if opts.from.is_some() && !opts.execute {
-        eprintln!("--from only makes sense together with --execute");
-        return 2;
-    }
-    if opts.execute {
-        execute(opts)
-    } else {
-        analyze(opts)
-    }
+/// Outcome of applying a reorg plan.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReorgSummary {
+    pub root: PathBuf,
+    pub moved: usize,
+    pub renamed: usize,
+    pub skipped: usize,
+    /// rename entries not applied because allow_rename is off
+    pub deferred_renames: usize,
+    pub failed: usize,
 }
 
-fn analyze(opts: ReorgOpts) -> i32 {
-    let Some(root) = resolve_root(opts.root.as_deref()) else {
-        return 2;
-    };
-    let template = match Template::parse(&opts.template) {
-        Ok(t) => t,
-        Err(e) => {
-            eprintln!("bad --template: {e}");
-            return 2;
-        }
-    };
-    let plan = build_plan(&root, &template, &opts.template);
-    print_report(&plan, &opts.plan);
-    match serde_json::to_string_pretty(&plan) {
-        Ok(json) => {
-            if let Err(e) = fs::write(&opts.plan, json + "\n") {
-                eprintln!("[warn] cannot write plan {}: {e}", opts.plan.display());
-            }
-        }
-        Err(e) => eprintln!("[warn] cannot serialize plan: {e}"),
+/// Classify every audio file under the root and optionally write the plan
+/// json for later `--from` execution.
+pub fn analyze(opts: &ReorgOpts, sink: Sink) -> Result<Plan> {
+    let root = config::resolve_library_root(opts.root.as_deref())?;
+    let template = Template::parse(&opts.template).map_err(|e| usage(format!("bad --template: {e}")))?;
+    let plan = build_plan(&root, &template, &opts.template, sink);
+    if let Some(plan_path) = &opts.plan {
+        write_plan(&plan, plan_path, sink);
     }
-    0
+    Ok(plan)
 }
 
-fn execute(opts: ReorgOpts) -> i32 {
+/// Read back a plan json written by [`analyze`].
+pub fn load_plan(path: &Path) -> Result<Plan> {
+    let raw = fs::read_to_string(path)
+        .map_err(|e| usage(format!("cannot read plan {}: {e}", path.display())))?;
+    serde_json::from_str(&raw).map_err(|e| usage(format!("bad plan file {}: {e}", path.display())))
+}
+
+/// Apply a plan (freshly analyzed or loaded with [`load_plan`]). Only "ready"
+/// entries move; renames need `allow_rename`.
+pub fn execute(opts: &ReorgOpts, sink: Sink) -> Result<ReorgSummary> {
     let plan = if let Some(from) = &opts.from {
-        let raw = match fs::read_to_string(from) {
-            Ok(r) => r,
-            Err(e) => {
-                eprintln!("cannot read plan {}: {e}", from.display());
-                return 2;
-            }
-        };
-        match serde_json::from_str(&raw) {
-            Ok(p) => p,
-            Err(e) => {
-                eprintln!("bad plan file {}: {e}", from.display());
-                return 2;
-            }
-        }
+        load_plan(from)?
     } else {
-        let Some(root) = resolve_root(opts.root.as_deref()) else {
-            return 2;
-        };
-        let template = match Template::parse(&opts.template) {
-            Ok(t) => t,
-            Err(e) => {
-                eprintln!("bad --template: {e}");
-                return 2;
-            }
-        };
-        build_plan(&root, &template, &opts.template)
+        let root = config::resolve_library_root(opts.root.as_deref())?;
+        let template =
+            Template::parse(&opts.template).map_err(|e| usage(format!("bad --template: {e}")))?;
+        build_plan(&root, &template, &opts.template, sink)
     };
 
-    let actionable: Vec<&PlanEntry> = plan
-        .entries
-        .iter()
-        .filter(|e| e.status == "ready")
-        .collect();
+    let actionable: Vec<&PlanEntry> = plan.entries.iter().filter(|e| e.status == "ready").collect();
     let mut deferred_renames = 0usize;
     if !opts.allow_rename {
         deferred_renames = actionable.iter().filter(|e| e.op.contains("rename")).count();
     }
 
-    let pb = ProgressBar::new(actionable.len() as u64);
-    if let Ok(style) = ProgressStyle::with_template(
-        "{spinner:.green} [{elapsed_precise}] [{bar:32.cyan/blue}] {pos}/{len} {msg}",
-    ) {
-        pb.set_style(style.progress_chars("\u{2588}\u{2592}\u{2591}"));
-    }
-
+    sink(&Event::Start(actionable.len() as u64));
     let mut moved = 0usize;
     let mut renamed = 0usize;
     let mut skipped = 0usize;
@@ -147,19 +114,19 @@ fn execute(opts: ReorgOpts) -> i32 {
     for entry in &actionable {
         let is_rename = entry.op.contains("rename");
         if is_rename && !opts.allow_rename {
-            pb.inc(1);
+            sink(&Event::Step(String::new()));
             continue;
         }
         let Some(dst) = entry.dst.as_deref() else {
-            pb.inc(1);
+            sink(&Event::Step(String::new()));
             continue;
         };
         let src = entry.src.as_path();
         if !src.is_file() {
-            pb.println(format!("[skip] source is gone: {}", src.display()));
+            sink(&Event::Line(format!("[skip] source is gone: {}", src.display())));
             skipped += 1;
         } else if dst.exists() {
-            pb.println(format!("[skip] target exists: {}", dst.display()));
+            sink(&Event::Line(format!("[skip] target exists: {}", dst.display())));
             skipped += 1;
         } else if let Err(e) = dst
             .parent()
@@ -167,70 +134,50 @@ fn execute(opts: ReorgOpts) -> i32 {
             .unwrap_or_else(|| Ok(()))
             .and_then(|_| fs::rename(src, dst))
         {
-            pb.println(format!("[fail] {}: {e}", src.display()));
+            sink(&Event::Line(format!("[fail] {}: {e}", src.display())));
             failed += 1;
         } else {
             moved += 1;
             if is_rename {
                 renamed += 1;
             }
-            pb.println(format!("[ok] {} -> {}", src.display(), dst.display()));
+            sink(&Event::Line(format!("[ok] {} -> {}", src.display(), dst.display())));
         }
-        pb.inc(1);
+        sink(&Event::Step(file_name(src)));
     }
-    pb.finish_and_clear();
-    println!(
-        "done: {moved} moved ({renamed} renamed), {skipped} skipped, \
-         {deferred_renames} renames deferred, {failed} failed"
-    );
-    println!();
-    println!("next step in rekordbox:");
-    println!("  File -> Display All Missing Files -> select all -> Relocate ->");
-    println!("  point it at {}", plan.root.display());
-    if renamed > 0 {
-        println!(
-            "  rekordbox matches relocated files by filename: relink the {renamed}"
-        );
-        println!("  renamed file(s) by hand.");
-    }
-    if failed > 0 {
-        1
-    } else {
-        0
+    Ok(ReorgSummary {
+        root: plan.root,
+        moved,
+        renamed,
+        skipped,
+        deferred_renames,
+        failed,
+    })
+}
+
+fn write_plan(plan: &Plan, plan_path: &Path, sink: Sink) {
+    match serde_json::to_string_pretty(plan) {
+        Ok(json) => {
+            if let Err(e) = fs::write(plan_path, json + "\n") {
+                sink(&Event::Warn(format!(
+                    "[warn] cannot write plan {}: {e}",
+                    plan_path.display()
+                )));
+            } else {
+                sink(&Event::Line(format!("plan written to {}", plan_path.display())));
+            }
+        }
+        Err(e) => sink(&Event::Warn(format!("[warn] cannot serialize plan: {e}"))),
     }
 }
 
-fn resolve_root(root: Option<&Path>) -> Option<PathBuf> {
-    let Some(raw) = root else {
-        eprintln!("--root is required (or pass --from <PLAN> together with --execute)");
-        return None;
-    };
-    match fs::canonicalize(raw) {
-        Ok(p) if p.is_dir() => Some(p),
-        Ok(_) => {
-            eprintln!("root is not a directory: {}", raw.display());
-            None
-        }
-        Err(e) => {
-            eprintln!("cannot resolve root {}: {e}", raw.display());
-            None
-        }
-    }
-}
-
-fn build_plan(root: &Path, template: &Template, template_str: &str) -> Plan {
+fn build_plan(root: &Path, template: &Template, template_str: &str, sink: Sink) -> Plan {
     let files = scan_audio(root);
-    let pb = ProgressBar::new(files.len() as u64);
-    if let Ok(style) = ProgressStyle::with_template(
-        "{spinner:.green} [{elapsed_precise}] [{bar:32.cyan/blue}] {pos}/{len} {msg}",
-    ) {
-        pb.set_style(style.progress_chars("\u{2588}\u{2592}\u{2591}"));
-    }
+    sink(&Event::Start(files.len() as u64));
 
     let mut entries = Vec::with_capacity(files.len());
     let mut dup_map: BTreeMap<(String, String), Vec<DupeFile>> = BTreeMap::new();
     for src in &files {
-        pb.set_message(file_name(src));
         let meta = tags::read_meta(src);
         if let Some(meta) = &meta {
             if let Some((artist, title)) = tags::identity(meta) {
@@ -252,9 +199,8 @@ fn build_plan(root: &Path, template: &Template, template_str: &str) -> Plan {
             },
         };
         entries.push(entry);
-        pb.inc(1);
+        sink(&Event::Step(file_name(src)));
     }
-    pb.finish_and_clear();
 
     let duplicates = dup_map
         .into_iter()
@@ -274,7 +220,7 @@ fn render_target(
     template: &Template,
     src: &Path,
     meta: Option<&TrackMeta>,
-) -> Result<PathBuf, String> {
+) -> std::result::Result<PathBuf, String> {
     let ext = src
         .extension()
         .and_then(|e| e.to_str())
@@ -341,68 +287,6 @@ fn in_place(src: &Path, dst: &Path) -> PlanEntry {
     }
 }
 
-fn print_report(plan: &Plan, plan_path: &Path) {
-    let mut counts: BTreeMap<&str, usize> = BTreeMap::new();
-    for e in &plan.entries {
-        // ready entries are grouped by their op (move/rename/move+rename),
-        // everything else by its status
-        let key = if e.status == "ready" {
-            e.op.as_str()
-        } else {
-            e.status.as_str()
-        };
-        *counts.entry(key).or_default() += 1;
-    }
-    println!("reorg analysis");
-    println!("  root: {}", plan.root.display());
-    println!("  template: {}", plan.template);
-    println!();
-    for (status, label) in [
-        ("move", "move"),
-        ("rename", "rename"),
-        ("move+rename", "move+rename"),
-        ("in-place", "in place"),
-        ("conflict", "conflict"),
-        ("untagged", "untagged"),
-    ] {
-        let n = counts.get(status).copied().unwrap_or(0);
-        if n > 0 {
-            println!("  {label:<12} {n}");
-        }
-    }
-    if counts.is_empty() {
-        println!("  (no audio files found)");
-    }
-    let renames = counts.get("rename").copied().unwrap_or(0)
-        + counts.get("move+rename").copied().unwrap_or(0);
-    if renames > 0 {
-        println!();
-        println!("  note: {renames} file(s) would be RENAMED. rekordbox relocates files by");
-        println!("  filename, so renames are skipped unless --allow-rename (then they");
-        println!("  must be relinked by hand in rekordbox).");
-    }
-    println!();
-    println!("plan written to {}", plan_path.display());
-    if !plan.duplicates.is_empty() {
-        println!();
-        println!("possible duplicates (same normalized artist + title):");
-        for g in &plan.duplicates {
-            println!("  {} / {} ({} files)", g.artist, g.title, g.files.len());
-            for f in &g.files {
-                let dur = f
-                    .duration_secs
-                    .map(|s| format!(" ({}:{:02})", s / 60, s % 60))
-                    .unwrap_or_default();
-                let size = f
-                    .size
-                    .map(|b| format!(", {:.1} MB", b as f64 / (1024.0 * 1024.0)))
-                    .unwrap_or_default();
-                println!("    - {}{}{}", f.path.display(), dur, size);
-            }
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -416,7 +300,9 @@ mod tests {
         ));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
-        dir
+        // analyze() canonicalizes the root; match that so path comparisons
+        // in the tests line up (/var -> /private/var on macOS)
+        fs::canonicalize(&dir).unwrap_or(dir)
     }
 
     fn write_tagged(path: &Path, artist: &str, title: Option<&str>) {
@@ -436,12 +322,24 @@ mod tests {
         tag.write_to_path(path, id3::Version::Id3v24).unwrap();
     }
 
+    fn no_sink(_: &Event) {}
+
+    fn opts(root: &Path, template: &str) -> ReorgOpts {
+        ReorgOpts {
+            root: Some(root.to_path_buf()),
+            template: template.to_string(),
+            execute: false,
+            from: None,
+            allow_rename: false,
+            plan: None,
+        }
+    }
+
     #[test]
     fn untagged_file_is_flagged() {
         let root = tmpdir("untagged");
         fs::write(root.join("song one.mp3"), b"junk").unwrap();
-        let template = Template::parse("{artist}/{filename}.{ext}").unwrap();
-        let plan = build_plan(&root, &template, "{artist}/{filename}.{ext}");
+        let plan = analyze(&opts(&root, "{artist}/{filename}.{ext}"), &no_sink).unwrap();
         assert_eq!(plan.entries.len(), 1);
         assert_eq!(plan.entries[0].status, "untagged");
         fs::remove_dir_all(&root).unwrap();
@@ -451,8 +349,7 @@ mod tests {
     fn tagged_file_is_classified_as_move() {
         let root = tmpdir("tagged");
         write_tagged(&root.join("song.mp3"), "Artist", None);
-        let template = Template::parse("{artist}/{filename}.{ext}").unwrap();
-        let plan = build_plan(&root, &template, "x");
+        let plan = analyze(&opts(&root, "{artist}/{filename}.{ext}"), &no_sink).unwrap();
         assert_eq!(plan.entries[0].status, "ready");
         assert_eq!(plan.entries[0].op, "move");
         let dst = plan.entries[0].dst.clone().unwrap();
@@ -466,8 +363,7 @@ mod tests {
         fs::create_dir_all(root.join("Artist")).unwrap();
         write_tagged(&root.join("Artist/song.mp3"), "Artist", None);
         write_tagged(&root.join("song.mp3"), "Artist", None);
-        let template = Template::parse("{artist}/{filename}.{ext}").unwrap();
-        let plan = build_plan(&root, &template, "x");
+        let plan = analyze(&opts(&root, "{artist}/{filename}.{ext}"), &no_sink).unwrap();
         let statuses: Vec<&str> = plan.entries.iter().map(|e| e.status.as_str()).collect();
         assert!(statuses.contains(&"conflict"));
         assert!(statuses.contains(&"in-place"));
@@ -479,8 +375,11 @@ mod tests {
         let root = tmpdir("rename");
         fs::create_dir_all(root.join("Artist")).unwrap();
         write_tagged(&root.join("Artist/song.mp3"), "Artist", Some("Title"));
-        let template = Template::parse("{artist}/{artist} - {title}.{ext}").unwrap();
-        let plan = build_plan(&root, &template, "x");
+        let plan = analyze(
+            &opts(&root, "{artist}/{artist} - {title}.{ext}"),
+            &no_sink,
+        )
+        .unwrap();
         assert_eq!(plan.entries[0].op, "rename");
         assert_eq!(plan.entries[0].status, "ready");
         fs::remove_dir_all(&root).unwrap();
@@ -492,10 +391,29 @@ mod tests {
         for name in ["a.mp3", "b.mp3"] {
             write_tagged(&root.join(name), "Artist", Some("Same Song"));
         }
-        let template = Template::parse("{artist}/{filename}.{ext}").unwrap();
-        let plan = build_plan(&root, &template, "x");
+        let plan = analyze(&opts(&root, "{artist}/{filename}.{ext}"), &no_sink).unwrap();
         assert_eq!(plan.duplicates.len(), 1);
         assert_eq!(plan.duplicates[0].files.len(), 2);
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn analyze_writes_plan_and_execute_from_plan_moves() {
+        let root = tmpdir("roundtrip");
+        write_tagged(&root.join("song.mp3"), "Artist", None);
+        let plan_path = root.join(".plan.json");
+        let mut o = opts(&root, "{artist}/{filename}.{ext}");
+        o.plan = Some(plan_path.clone());
+        analyze(&o, &no_sink).unwrap();
+        assert!(plan_path.is_file());
+
+        let mut exec = opts(&root, "{artist}/{filename}.{ext}");
+        exec.execute = true;
+        exec.from = Some(plan_path.clone());
+        let summary = execute(&exec, &no_sink).unwrap();
+        assert_eq!(summary.moved, 1);
+        assert_eq!(summary.failed, 0);
+        assert!(root.join("Artist/song.mp3").is_file());
         fs::remove_dir_all(&root).unwrap();
     }
 }

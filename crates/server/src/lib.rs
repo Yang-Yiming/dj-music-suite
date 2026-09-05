@@ -2,10 +2,11 @@
 //! that wraps the core convert/import flows for non-CLI users.
 
 pub mod api;
-pub mod config;
 pub mod state;
 
 use std::sync::Arc;
+
+use dj_music_core::config;
 
 pub struct ServeOpts {
     pub port: u16,
