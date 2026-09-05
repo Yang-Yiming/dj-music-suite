@@ -2,7 +2,8 @@
 
 Small tools for DJ music libraries: convert NetEase `.ncm` files to mp3/flac
 with full tags, import new music into a library folder with duplicate
-detection, and reorganize a library folder on disk.
+detection, and reorganize a library folder on disk. Comes as a CLI and a
+local web UI.
 
 ## Usage
 
@@ -11,6 +12,7 @@ cargo build --release
 ./target/release/dj-music-suite convert --input <DIR> --output <DIR>
 ./target/release/dj-music-suite import --input <DIR> --root <MUSIC_DIR>
 ./target/release/dj-music-suite reorg --root <MUSIC_DIR>
+./target/release/dj-music-suite serve   # web UI, opens in the browser
 ```
 
 The CLI is self-explanatory: running it with no arguments (or `help`) prints
@@ -89,6 +91,30 @@ The analysis classifies every file: `move` / `rename` / `move+rename`,
 (missing a tag the template needs) and possible duplicates (same normalized
 artist + title). Only `move` entries execute by default; renames need
 `--allow-rename`; conflicts and untagged files are never touched.
+
+## serve
+
+A local web UI covering the two flows non-CLI users need: converting `.ncm`
+files and importing music into the library. Everything stays on the machine —
+the server listens on `127.0.0.1` only, and files are uploaded into a local
+staging folder (never sent anywhere).
+
+```bash
+./target/release/dj-music-suite serve [--port 8765] [--no-open]
+```
+
+The page walks through the steps: set the library root once (stored in the
+app config dir, e.g. `~/Library/Application Support/dj-music-suite/config.toml`
+on macOS), drag & drop files, convert with tags/covers/lyrics, then run the
+import analysis. The analysis shows a preview table — new / alt-version /
+duplicate / conflict / untagged — and writes to the library only after an
+explicit confirmation (the same analyze → execute two-phase design as the
+CLI). Progress streams live into the page. `--no-open` skips launching the
+browser automatically.
+
+Workspace layout: `crates/core` (UI-agnostic logic, event sink + structured
+results), `crates/cli` (argument parsing + terminal rendering),
+`crates/server` (axum web UI calling into core).
 
 ## Acknowledgements
 

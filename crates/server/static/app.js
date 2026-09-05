@@ -190,10 +190,9 @@ function startConvert() {
   }).then(() => {
     watchJob("convert", {
       onDone: (result) => {
-        setStatus("convert-status-ok", "", "");
         appendLog("convert-log", `完成：转换 ${result.total - result.failed} 个，写标签 ${result.tagged} 个，失败 ${result.failed} 个`);
         if (result.failed === 0) {
-          setStatus("upload-status", `✓ 转换完成，可以继续第 4 步导入`, "ok");
+          setStatus("upload-status", "✓ 转换完成，可以继续第 4 步导入", "ok");
         } else {
           setStatus("upload-status", `转换完成但有 ${result.failed} 个失败，详见日志`, "err");
         }

@@ -117,10 +117,16 @@ pub fn start_job(
     if slot.as_ref().is_some_and(|j| j.status == JobStatus::Running) {
         return Err("有任务正在运行，请等待它完成".to_string());
     }
+    // log lines carry full filesystem paths from core; replace the staging
+    // prefix so the web log stays readable (library paths stay untouched)
+    let staging_prefix = staging_id
+        .as_ref()
+        .and_then(|id| state.staging_dir(id))
+        .map(|p| p.to_string_lossy().into_owned());
     let log = Arc::new(JobLog::default());
     *slot = Some(Job {
-        kind,
         staging_id,
+        kind,
         status: JobStatus::Running,
         log: Arc::clone(&log),
         result: Mutex::new(None),
@@ -131,7 +137,7 @@ pub fn start_job(
     let state = Arc::clone(state);
     std::thread::spawn(move || {
         let sink = move |event: &dj_music_core::Event| {
-            log.push(event_json(event));
+            log.push(event_json(&shorten_event(event, staging_prefix.as_deref())));
         };
         let outcome = run(&sink);
         let mut slot = state.job.lock().unwrap();
@@ -149,6 +155,22 @@ pub fn start_job(
         }
     });
     Ok(())
+}
+
+fn shorten_event(
+    event: &dj_music_core::Event,
+    staging_prefix: Option<&str>,
+) -> dj_music_core::Event {
+    use dj_music_core::Event;
+    let Some(prefix) = staging_prefix else {
+        return event.clone();
+    };
+    let shorten = |text: &str| text.replace(&prefix, "~");
+    match event {
+        Event::Line(text) => Event::Line(shorten(text)),
+        Event::Warn(text) => Event::Warn(shorten(text)),
+        other => other.clone(),
+    }
 }
 
 pub fn event_json(event: &dj_music_core::Event) -> serde_json::Value {
