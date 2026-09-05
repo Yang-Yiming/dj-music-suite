@@ -1,6 +1,7 @@
 <script lang="ts">
   import {
     batch,
+    clearDoneBanner,
     decide,
     doAnalyze,
     doExecute,
@@ -158,19 +159,18 @@
       </div>
     {/if}
   {/if}
+{/if}
 
-  {#if batch.executeResult}
-    <div class="mt-4 rounded-lg bg-emerald-50 p-4 text-sm text-emerald-800">
-      ✓ 写入 {batch.executeResult.placed}
-        个文件{batch.executeResult.failed ? `，${batch.executeResult.failed} 个失败（见日志）` : ""}。到
-        rekordbox 里导入/刷新曲库根目录即可看到新歌。
-      <button
-        class="ml-2 rounded-md border border-emerald-300 bg-white px-2 py-0.5 text-xs text-emerald-700 hover:bg-emerald-100"
-        onclick={resetBatch}
-        disabled={batch.clearing}
-      >
-        清理暂存文件，处理下一批
-      </button>
-    </div>
-  {/if}
+{#if batch.executeResult}
+  <div class="mt-4 rounded-lg bg-emerald-50 p-4 text-sm text-emerald-800">
+    ✓ 写入 {batch.executeResult.placed}
+      个文件{batch.executeResult.failed ? `，${batch.executeResult.failed} 个失败（见日志）` : ""}。到
+      rekordbox 里导入/刷新曲库根目录即可看到新歌。暂存文件已自动清理。
+    <button
+      class="ml-2 rounded-md border border-emerald-300 bg-white px-2 py-0.5 text-xs text-emerald-700 hover:bg-emerald-100"
+      onclick={clearDoneBanner}
+    >
+      处理下一批
+    </button>
+  </div>
 {/if}

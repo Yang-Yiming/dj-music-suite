@@ -158,7 +158,11 @@ export async function doExecute() {
     );
     const end = await watchJob("import-execute");
     if (end.type === "done") {
-      batch.executeResult = end.result as ExecuteResult;
+      // the server auto-cleaned the staging dir on full success; drop the
+      // batch state but keep the completion banner
+      const result = end.result as ExecuteResult;
+      clearLocalBatch();
+      batch.executeResult = result;
     } else {
       batch.executeError = end.type === "error" ? end.message : "没有收到导入任务";
     }
@@ -169,8 +173,15 @@ export async function doExecute() {
   }
 }
 
+export function clearDoneBanner() {
+  batch.executeResult = null;
+}
+
 export async function resetBatch() {
-  if (!batch.stagingId) return;
+  if (!batch.stagingId) {
+    batch.executeResult = null;
+    return;
+  }
   batch.clearing = true;
   try {
     await clearStaging(batch.stagingId);
@@ -178,6 +189,7 @@ export async function resetBatch() {
     // staging cleanup is best-effort
   }
   clearLocalBatch();
+  batch.executeResult = null;
   batch.clearing = false;
 }
 
@@ -190,7 +202,6 @@ function clearLocalBatch() {
   batch.convertError = "";
   batch.plan = null;
   batch.decisions = {};
-  batch.executeResult = null;
   batch.executeError = "";
 }
 
@@ -204,7 +215,12 @@ function applyEnd(kind: string, end: { type: string; result?: unknown; message?:
   }
   if (kind === "convert") batch.convertDone = end.result as ConvertResult;
   else if (kind === "import-analyze") batch.plan = end.result as ImportPlan;
-  else if (kind === "import-execute") batch.executeResult = end.result as ExecuteResult;
+  else if (kind === "import-execute") {
+    // success implies the staging dir was auto-cleaned server-side
+    const result = end.result as ExecuteResult;
+    clearLocalBatch();
+    batch.executeResult = result;
+  }
 }
 
 /// Restore state after a page reload. Returns the tab that owns the

@@ -482,9 +482,28 @@ async fn import_execute(
             .retain(|item| include.contains(&item.src.to_string_lossy().into_owned()));
     }
 
+    let staging_dir = state
+        .staging_dir(&staging_id)
+        .filter(|p| p.is_dir());
+    let state2 = Arc::clone(&state);
+    let sid = staging_id.clone();
     let result = start_job(&state, JobKind::ImportExecute, Some(staging_id), move |sink: dj_music_core::Sink| {
         let summary = core_import::execute(&plan, mode, overwrite, sink);
-        Ok(json!({"placed": summary.placed, "failed": summary.failed}))
+        // fully successful batch: drop the staging dir (uploads + converted
+        // output) and the stored plan; "from folder" originals live outside
+        // staging and are not touched. Failures keep the scene for a retry.
+        let cleaned = summary.failed == 0;
+        if cleaned {
+            if let Some(dir) = &staging_dir {
+                let _ = std::fs::remove_dir_all(dir);
+            }
+            state2.plans.lock().unwrap().remove(&sid);
+        }
+        Ok(json!({
+            "placed": summary.placed,
+            "failed": summary.failed,
+            "cleaned": cleaned,
+        }))
     });
     match result {
         Ok(()) => Json(json!({"started": true})).into_response(),
