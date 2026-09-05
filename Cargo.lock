@@ -388,6 +388,7 @@ version = "0.1.0"
 dependencies = [
  "axum",
  "clap",
+ "dirs",
  "dj-music-core",
  "mime_guess",
  "rust-embed",
@@ -396,6 +397,7 @@ dependencies = [
  "tokio",
  "tokio-stream",
  "uuid",
+ "walkdir",
 ]
 
 [[package]]

@@ -11,16 +11,20 @@ import {
   startConvert,
   startExecute,
   upload,
+  useFolder,
   type ConvertResult,
   type ExecuteResult,
   type ImportPlan,
   type JobSnapshot,
+  type UploadResult,
 } from "./api";
 import { job, resumeRunningJob, watchJob } from "./job.svelte";
 
 export const batch = $state<{
   stagingId: string | null;
-  counts: { ncm: number; audio: number; other: number };
+  /** registered local folder (read in place, not uploaded) */
+  fromFolder: string | null;
+  counts: { ncm: number; audio: number; lyrics: number; image: number; other: number };
   uploading: boolean;
   uploadError: string;
   convertDone: ConvertResult | null;
@@ -37,7 +41,8 @@ export const batch = $state<{
   clearing: boolean;
 }>({
   stagingId: null,
-  counts: { ncm: 0, audio: 0, other: 0 },
+  fromFolder: null,
+  counts: { ncm: 0, audio: 0, lyrics: 0, image: 0, other: 0 },
   uploading: false,
   uploadError: "",
   convertDone: null,
@@ -54,22 +59,40 @@ export const batch = $state<{
   clearing: false,
 });
 
-export async function uploadFiles(files: File[]) {
+function applyUpload(result: UploadResult) {
+  batch.stagingId = result.staging_id;
+  batch.fromFolder = null;
+  batch.counts = { ncm: 0, audio: 0, lyrics: 0, image: 0, other: 0 };
+  for (const f of result.files) batch.counts[f.kind] += 1;
+  batch.convertDone = null;
+  batch.convertSkipped = false;
+  batch.convertError = "";
+  batch.plan = null;
+  batch.decisions = {};
+  batch.executeResult = null;
+  batch.executeError = "";
+}
+
+export async function uploadFiles(files: { file: File; path: string }[]) {
   if (!files.length || job.running) return;
   batch.uploading = true;
   batch.uploadError = "";
   try {
-    const result = await upload(files);
-    batch.stagingId = result.staging_id;
-    batch.counts = { ncm: 0, audio: 0, other: 0 };
-    for (const f of result.files) batch.counts[f.kind] += 1;
-    batch.convertDone = null;
-    batch.convertSkipped = false;
-    batch.convertError = "";
-    batch.plan = null;
-    batch.decisions = {};
-    batch.executeResult = null;
-    batch.executeError = "";
+    applyUpload(await upload(files));
+  } catch (e) {
+    batch.uploadError = e instanceof Error ? e.message : String(e);
+  } finally {
+    batch.uploading = false;
+  }
+}
+
+export async function importFolder(path: string) {
+  if (job.running) return;
+  batch.uploading = true;
+  batch.uploadError = "";
+  try {
+    applyUpload(await useFolder(path));
+    batch.fromFolder = path;
   } catch (e) {
     batch.uploadError = e instanceof Error ? e.message : String(e);
   } finally {
@@ -160,7 +183,8 @@ export async function resetBatch() {
 
 function clearLocalBatch() {
   batch.stagingId = null;
-  batch.counts = { ncm: 0, audio: 0, other: 0 };
+  batch.fromFolder = null;
+  batch.counts = { ncm: 0, audio: 0, lyrics: 0, image: 0, other: 0 };
   batch.convertDone = null;
   batch.convertSkipped = false;
   batch.convertError = "";

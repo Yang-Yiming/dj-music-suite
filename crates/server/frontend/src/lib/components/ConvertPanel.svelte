@@ -1,5 +1,7 @@
 <script lang="ts">
-  import { batch, doConvert, resetBatch, uploadFiles } from "../batch.svelte";
+  import { onMount } from "svelte";
+  import { batch, doConvert, importFolder, resetBatch, uploadFiles } from "../batch.svelte";
+  import { detectNetease } from "../api";
   import { job } from "../job.svelte";
   import Dropzone from "./Dropzone.svelte";
   import LogPanel from "./LogPanel.svelte";
@@ -13,14 +15,61 @@
       !batch.convertDone &&
       !batch.convertSkipped,
   );
+
+  // ---- netease download folder detection ----
+  let netease = $state<{ path: string; count: number } | null>(null);
+  let neteaseError = $state("");
+  let neteaseLoading = $state(false);
+
+  onMount(async () => {
+    try {
+      const found = await detectNetease();
+      if (found.path) netease = { path: found.path, count: found.count ?? 0 };
+    } catch {
+      // detection is best-effort
+    }
+  });
+
+  async function useNetease() {
+    if (!netease) return;
+    neteaseLoading = true;
+    neteaseError = "";
+    try {
+      await importFolder(netease.path);
+    } catch (e) {
+      neteaseError = e instanceof Error ? e.message : String(e);
+    } finally {
+      neteaseLoading = false;
+    }
+  }
 </script>
 
 {#if batch.stagingId === null}
-  <p class="text-sm text-slate-500">把 .ncm 文件拖进来，解密成 mp3/flac 并写入标题、歌手、专辑、封面和歌词。</p>
+  {#if netease}
+    <div class="mb-3 flex flex-wrap items-center gap-3 rounded-xl border border-blue-200 bg-blue-50 px-4 py-3">
+      <div class="min-w-0 flex-1">
+        <p class="text-sm font-medium text-blue-900">检测到网易云下载目录</p>
+        <p class="truncate text-xs text-blue-700" title={netease.path}>
+          {netease.path} · 含 {netease.count} 个 .ncm
+        </p>
+      </div>
+      <button
+        class="rounded-lg bg-blue-600 px-3 py-1.5 text-xs font-medium text-white hover:bg-blue-700 disabled:opacity-50"
+        disabled={neteaseLoading || job.running}
+        onclick={useNetease}
+      >
+        直接使用
+      </button>
+    </div>
+  {/if}
+  {#if neteaseError}
+    <p class="mb-2 text-xs text-red-600">{neteaseError}</p>
+  {/if}
+  <p class="text-sm text-slate-500">把 .ncm 文件或整个下载文件夹拖进来，解密成 mp3/flac 并写入标题、歌手、专辑、封面和歌词。</p>
   <div class="mt-3">
-    <Dropzone onFiles={uploadFiles} />
+    <Dropzone onFiles={uploadFiles} folder />
     {#if batch.uploading}
-      <p class="mt-2 text-xs text-slate-500">正在上传…</p>
+      <p class="mt-2 text-xs text-slate-500">正在处理…</p>
     {/if}
     {#if batch.uploadError}
       <p class="mt-2 text-xs text-red-600">{batch.uploadError}</p>
@@ -29,8 +78,11 @@
 {:else}
   <div class="flex flex-wrap items-center gap-3 text-sm">
     <span class="font-medium text-emerald-700">✓ 已接收</span>
+    {#if batch.fromFolder}<span class="rounded-full bg-slate-100 px-2.5 py-0.5 text-xs text-slate-500">原文件夹：{batch.fromFolder}</span>{/if}
     {#if batch.counts.ncm}<span class="rounded-full bg-blue-50 px-2.5 py-0.5 text-xs text-blue-700">{batch.counts.ncm} 个 NCM</span>{/if}
     {#if batch.counts.audio}<span class="rounded-full bg-blue-50 px-2.5 py-0.5 text-xs text-blue-700">{batch.counts.audio} 个音频</span>{/if}
+    {#if batch.counts.lyrics}<span class="rounded-full bg-violet-50 px-2.5 py-0.5 text-xs text-violet-700">{batch.counts.lyrics} 个歌词</span>{/if}
+    {#if batch.counts.image}<span class="rounded-full bg-violet-50 px-2.5 py-0.5 text-xs text-violet-700">{batch.counts.image} 张图片</span>{/if}
     {#if batch.counts.other}<span class="rounded-full bg-slate-100 px-2.5 py-0.5 text-xs text-slate-500">{batch.counts.other} 个其它</span>{/if}
     <button
       class="ml-auto text-xs text-slate-500 underline hover:text-slate-700"

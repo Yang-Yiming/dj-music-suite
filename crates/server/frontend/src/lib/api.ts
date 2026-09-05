@@ -17,9 +17,11 @@ export interface ImportPlan {
   items: ImportItem[];
 }
 
+export type FileKind = "ncm" | "audio" | "lyrics" | "image" | "other";
+
 export interface UploadedFile {
   name: string;
-  kind: "ncm" | "audio" | "other";
+  kind: FileKind;
 }
 
 export interface UploadResult {
@@ -98,11 +100,26 @@ export const setConfig = (library_root: string) =>
     body: JSON.stringify({ library_root }),
   });
 
-export const upload = (files: File[]) => {
+export const upload = (files: { file: File; path: string }[]) => {
   const form = new FormData();
-  for (const f of files) form.append("files", f, f.name);
+  // relative paths (folder structure) ride along in one JSON field; the
+  // server pairs them with the file parts by order
+  form.append("paths", JSON.stringify(files.map((f) => f.path)));
+  for (const f of files) {
+    form.append("file", f.file, f.path.split("/").pop() ?? f.path);
+  }
   return call<UploadResult>("/api/upload", { method: "POST", body: form });
 };
+
+export const detectNetease = () =>
+  call<{ path: string | null; count?: number }>("/api/detect-netease");
+
+export const useFolder = (path: string) =>
+  call<UploadResult>("/api/staging/from-folder", {
+    method: "POST",
+    headers: jsonHeaders,
+    body: JSON.stringify({ path }),
+  });
 
 export const startConvert = (stagingId: string, noDownload: boolean) =>
   call<{ started: boolean }>("/api/convert", {

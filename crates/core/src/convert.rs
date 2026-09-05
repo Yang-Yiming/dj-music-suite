@@ -365,6 +365,7 @@ fn tag_file(
     let mut cover_mime = String::new();
     let mut cover_data: Option<Vec<u8>> = None;
     if let (Some(meta_dir), Some(meta)) = (ctx.meta_dir.as_ref(), meta.as_ref()) {
+
         if meta_dir.is_dir() && !meta.music_id.is_empty() {
             for ext in ["jpg", "jpeg", "png", "webp"] {
                 let p = meta_dir.join(format!("track-{}.{}", meta.music_id, ext));

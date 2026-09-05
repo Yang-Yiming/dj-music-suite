@@ -52,7 +52,7 @@
     如果文件来自「转换」标签的 .ncm 结果，也在这里导入。
   </p>
   <div class="mt-3">
-    <Dropzone onFiles={uploadFiles} />
+    <Dropzone onFiles={uploadFiles} folder />
     {#if batch.uploading}
       <p class="mt-2 text-xs text-slate-500">正在上传…</p>
     {/if}
