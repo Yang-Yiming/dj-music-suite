@@ -2,53 +2,25 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use clap::{Args, ValueEnum};
-use indicatif::{ProgressBar, ProgressStyle};
+use serde::{Deserialize, Serialize};
 
 use crate::scan::{file_name, scan_audio};
 use crate::tags;
 use crate::template::{RenderValues, Template};
+use crate::{usage, Event, Error, Result, Sink};
 
 /// same artist + title with durations within this delta counts as a duplicate
 const DUPLICATE_DELTA_SECS: u64 = 3;
 
-#[derive(Args)]
-pub struct ImportOpts {
-    /// folder with new audio files to import (scanned recursively)
-    #[arg(long, value_name = "DIR")]
-    input: PathBuf,
-
-    /// music library root to import into
-    #[arg(long, value_name = "DIR")]
-    root: PathBuf,
-
-    /// destination layout relative to the root; placeholders: {artist},
-    /// {title}, {album}, {filename} (original name), {ext}
-    #[arg(long, value_name = "TEMPLATE", default_value = "{artist}/{filename}.{ext}")]
-    template: String,
-
-    /// move files into the library instead of copying
-    #[arg(long, value_enum, default_value_t = Mode::Copy)]
-    mode: Mode,
-
-    /// on duplicate/conflict, replace the existing library file with the
-    /// incoming one instead of skipping (atomic tmp+rename)
-    #[arg(long)]
-    overwrite: bool,
-
-    /// actually place the files (default: report only)
-    #[arg(long)]
-    execute: bool,
-}
-
-#[derive(Clone, Copy, PartialEq, ValueEnum)]
-enum Mode {
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum Mode {
     Copy,
     Move,
 }
 
-#[derive(Clone, Copy, PartialEq, Debug)]
-enum Disposition {
+#[derive(Clone, Copy, PartialEq, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Disposition {
     /// not in the library yet
     New,
     /// same artist + title but a different duration: likely another mix,
@@ -62,14 +34,35 @@ enum Disposition {
     Untagged,
 }
 
-struct Item {
-    src: PathBuf,
-    dst: Option<PathBuf>,
-    /// for duplicates: the matched library file that --overwrite would
+#[derive(Clone, Serialize, Deserialize)]
+pub struct ImportItem {
+    pub src: PathBuf,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dst: Option<PathBuf>,
+    /// for duplicates: the matched library file that overwrite would
     /// replace (content refreshed in place, path unchanged)
-    replace: Option<PathBuf>,
-    disposition: Disposition,
-    note: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replace: Option<PathBuf>,
+    pub disposition: Disposition,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+}
+
+/// Serializable result of analyzing an import batch: enough to render a
+/// preview (web UI) and to drive [`execute`] afterwards.
+#[derive(Serialize, Deserialize)]
+pub struct ImportPlan {
+    pub input: PathBuf,
+    pub root: PathBuf,
+    pub template: String,
+    pub items: Vec<ImportItem>,
+}
+
+/// Outcome of executing an import plan.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ImportSummary {
+    pub placed: usize,
+    pub failed: usize,
 }
 
 struct LibEntry {
@@ -79,40 +72,27 @@ struct LibEntry {
 
 type Index = BTreeMap<(String, String), Vec<LibEntry>>;
 
-pub fn cmd_import(opts: ImportOpts) -> i32 {
-    let input = match fs::canonicalize(&opts.input) {
+/// Index the library and classify every new file against it. The returned
+/// plan is purely informational until [`execute`] is called on it.
+pub fn analyze(input: &Path, root: &Path, template_str: &str, sink: Sink) -> Result<ImportPlan> {
+    let input = match fs::canonicalize(input) {
         Ok(p) if p.is_dir() => p,
-        Ok(_) => {
-            eprintln!("input is not a directory: {}", opts.input.display());
-            return 2;
-        }
+        Ok(_) => return Err(usage(format!("input is not a directory: {}", input.display()))),
         Err(e) => {
-            eprintln!("cannot resolve input {}: {e}", opts.input.display());
-            return 2;
+            return Err(usage(format!("cannot resolve input {}: {e}", input.display())))
         }
     };
-    let root = match fs::canonicalize(&opts.root) {
+    let root = match fs::canonicalize(root) {
         Ok(p) if p.is_dir() => p,
-        Ok(_) => {
-            eprintln!("root is not a directory: {}", opts.root.display());
-            return 2;
-        }
-        Err(e) => {
-            eprintln!("cannot resolve root {}: {e}", opts.root.display());
-            return 2;
-        }
+        Ok(_) => return Err(usage(format!("root is not a directory: {}", root.display()))),
+        Err(e) => return Err(usage(format!("cannot resolve root {}: {e}", root.display()))),
     };
-    let template = match Template::parse(&opts.template) {
-        Ok(t) => t,
-        Err(e) => {
-            eprintln!("bad --template: {e}");
-            return 2;
-        }
-    };
+    let template =
+        Template::parse(template_str).map_err(|e| usage(format!("bad --template: {e}")))?;
 
     // index the library by (artist, title) for duplicate detection
     let lib_files = scan_audio(&root);
-    let pb = progress_bar(lib_files.len() as u64);
+    sink(&Event::Start(lib_files.len() as u64));
     let mut index = Index::new();
     for path in &lib_files {
         if let Some(meta) = tags::read_meta(path) {
@@ -126,33 +106,32 @@ pub fn cmd_import(opts: ImportOpts) -> i32 {
                     });
             }
         }
-        pb.inc(1);
+        sink(&Event::Step(file_name(path)));
     }
-    pb.finish_and_clear();
 
     let files = scan_audio(&input);
     if files.is_empty() {
-        eprintln!("no audio files found in {}", input.display());
-        return 1;
+        return Err(Error::Runtime(format!(
+            "no audio files found in {}",
+            input.display()
+        )));
     }
-    let pb = progress_bar(files.len() as u64);
+    sink(&Event::Start(files.len() as u64));
     let mut items = Vec::with_capacity(files.len());
     for src in &files {
-        pb.set_message(file_name(src));
         items.push(classify_item(src, &root, &template, &mut index));
-        pb.inc(1);
+        sink(&Event::Step(file_name(src)));
     }
-    pb.finish_and_clear();
 
-    print_report(&items, &input, &root, &opts.template, opts.mode, opts.overwrite);
-    if opts.execute {
-        place(&items, opts.mode, opts.overwrite)
-    } else {
-        0
-    }
+    Ok(ImportPlan {
+        input,
+        root,
+        template: template_str.to_string(),
+        items,
+    })
 }
 
-fn classify_item(src: &Path, root: &Path, template: &Template, index: &mut Index) -> Item {
+fn classify_item(src: &Path, root: &Path, template: &Template, index: &mut Index) -> ImportItem {
     let meta = tags::read_meta(src);
     let ext = src
         .extension()
@@ -175,7 +154,7 @@ fn classify_item(src: &Path, root: &Path, template: &Template, index: &mut Index
     let components = match template.render(&vals) {
         Ok(c) => c,
         Err(reason) => {
-            return Item {
+            return ImportItem {
                 src: src.to_path_buf(),
                 dst: None,
                 replace: None,
@@ -188,7 +167,7 @@ fn classify_item(src: &Path, root: &Path, template: &Template, index: &mut Index
         .iter()
         .fold(root.to_path_buf(), |p, c| p.join(c));
     if dst.exists() {
-        return Item {
+        return ImportItem {
             src: src.to_path_buf(),
             dst: Some(dst),
             replace: None,
@@ -206,7 +185,7 @@ fn classify_item(src: &Path, root: &Path, template: &Template, index: &mut Index
                         .unwrap_or_else(|| "?".to_string())
                 };
                 return match entries.iter().find(|e| close(e.duration_secs, dur)) {
-                    Some(entry) => Item {
+                    Some(entry) => ImportItem {
                         src: src.to_path_buf(),
                         dst: Some(dst),
                         replace: Some(entry.path.clone()),
@@ -219,7 +198,7 @@ fn classify_item(src: &Path, root: &Path, template: &Template, index: &mut Index
                     },
                     None => {
                         let entry = &entries[0];
-                        Item {
+                        ImportItem {
                             src: src.to_path_buf(),
                             dst: Some(dst),
                             replace: None,
@@ -243,7 +222,7 @@ fn classify_item(src: &Path, root: &Path, template: &Template, index: &mut Index
         }
     }
 
-    Item {
+    ImportItem {
         src: src.to_path_buf(),
         dst: Some(dst),
         replace: None,
@@ -260,99 +239,12 @@ fn close(a: Option<u64>, b: Option<u64>) -> bool {
     }
 }
 
-fn print_report(
-    items: &[Item],
-    input: &Path,
-    root: &Path,
-    template: &str,
-    mode: Mode,
-    overwrite: bool,
-) {
-    let mut counts: BTreeMap<&'static str, usize> = BTreeMap::new();
-    for item in items {
-        let key = match item.disposition {
-            Disposition::New => "new",
-            Disposition::AltVersion => "alt-version",
-            Disposition::Duplicate => "duplicate",
-            Disposition::Conflict => "conflict",
-            Disposition::Untagged => "untagged",
-        };
-        *counts.entry(key).or_default() += 1;
-    }
-    let (dup_hint, conflict_hint) = if overwrite {
-        (
-            "will replace the matched library file",
-            "will overwrite the target file",
-        )
-    } else {
-        (
-            "skipped: same artist + title in library",
-            "skipped: target exists",
-        )
-    };
-    println!("import analysis");
-    println!("  input: {}", input.display());
-    println!("  library: {}", root.display());
-    println!("  template: {template}");
-    println!();
-    for (key, label, hint) in [
-        ("new", "new", ""),
-        ("alt-version", "alt-version", "imported: same song, different duration"),
-        ("duplicate", "duplicate", dup_hint),
-        ("conflict", "conflict", conflict_hint),
-        ("untagged", "untagged", "skipped: missing tags for template"),
-    ] {
-        let n = counts.get(key).copied().unwrap_or(0);
-        if n > 0 {
-            if hint.is_empty() {
-                println!("  {label:<12} {n}");
-            } else {
-                println!("  {label:<12} {n}  ({hint})");
-            }
-        }
-    }
-    for item in items {
-        let detail = matches!(
-            item.disposition,
-            Disposition::AltVersion | Disposition::Duplicate | Disposition::Conflict | Disposition::Untagged
-        );
-        if detail {
-            println!(
-                "  - {}: {}",
-                file_name(&item.src),
-                item.note.as_deref().unwrap_or("")
-            );
-        }
-    }
-    let placed = counts.get("new").copied().unwrap_or(0)
-        + counts.get("alt-version").copied().unwrap_or(0);
-    let replaced = if overwrite {
-        counts.get("duplicate").copied().unwrap_or(0)
-            + counts.get("conflict").copied().unwrap_or(0)
-    } else {
-        0
-    };
-    let verb = match mode {
-        Mode::Copy => "copied",
-        Mode::Move => "moved",
-    };
-    let total = placed + replaced;
-    if total == 0 {
-        println!();
-        println!("nothing to import");
-    } else if replaced > 0 {
-        println!();
-        println!(
-            "with --execute: {placed} file(s) and {replaced} replacement(s) would be {verb} into the library"
-        );
-    } else {
-        println!();
-        println!("with --execute: {total} file(s) would be {verb} into the library");
-    }
-}
-
-fn place(items: &[Item], mode: Mode, overwrite: bool) -> i32 {
-    let actionable: Vec<&Item> = items
+/// Place the plan's actionable files into the library. Replacements
+/// (duplicates/conflicts) only happen when `overwrite` is set; each placement
+/// is atomic (tmp file + rename) so a failure never corrupts a library file.
+pub fn execute(plan: &ImportPlan, mode: Mode, overwrite: bool, sink: Sink) -> ImportSummary {
+    let actionable: Vec<&ImportItem> = plan
+        .items
         .iter()
         .filter(|i| match i.disposition {
             Disposition::New | Disposition::AltVersion => true,
@@ -360,7 +252,7 @@ fn place(items: &[Item], mode: Mode, overwrite: bool) -> i32 {
             Disposition::Untagged => false,
         })
         .collect();
-    let pb = progress_bar(actionable.len() as u64);
+    sink(&Event::Start(actionable.len() as u64));
     let verb = match mode {
         Mode::Copy => "copied",
         Mode::Move => "moved",
@@ -375,15 +267,15 @@ fn place(items: &[Item], mode: Mode, overwrite: bool) -> i32 {
             _ => item.dst.as_deref(),
         };
         let Some(target) = target else {
-            pb.inc(1);
+            sink(&Event::Step(String::new()));
             continue;
         };
         if item.src == target {
-            pb.println(format!(
+            sink(&Event::Line(format!(
                 "[skip] {} is already the library file",
                 item.src.display()
-            ));
-            pb.inc(1);
+            )));
+            sink(&Event::Step(String::new()));
             continue;
         }
         let result = target
@@ -394,16 +286,16 @@ fn place(items: &[Item], mode: Mode, overwrite: bool) -> i32 {
         let placed_ok = result.is_ok();
         if let Err(e) = result {
             failed += 1;
-            pb.println(format!("[fail] {}: {e}", item.src.display()));
+            sink(&Event::Line(format!("[fail] {}: {e}", item.src.display())));
         }
         if placed_ok {
             if mode == Mode::Move {
                 if let Err(e) = fs::remove_file(&item.src) {
                     failed += 1;
-                    pb.println(format!(
+                    sink(&Event::Line(format!(
                         "[warn] copied but cannot remove {}: {e}",
                         item.src.display()
-                    ));
+                    )));
                 }
             }
             placed += 1;
@@ -413,25 +305,16 @@ fn place(items: &[Item], mode: Mode, overwrite: bool) -> i32 {
             } else {
                 verb
             };
-            pb.println(format!(
+            sink(&Event::Line(format!(
                 "[ok] {} {} -> {}",
                 what,
                 item.src.display(),
                 target.display()
-            ));
+            )));
         }
-        pb.inc(1);
+        sink(&Event::Step(file_name(&item.src)));
     }
-    pb.finish_and_clear();
-    println!("done: {placed} placed, {failed} failed");
-    println!();
-    println!("next step in rekordbox: import/refresh the library root folder -");
-    println!("new tracks come in with tags and artwork already embedded.");
-    if failed > 0 {
-        1
-    } else {
-        0
-    }
+    ImportSummary { placed, failed }
 }
 
 /// Copy `src` onto `dst` atomically: write a hidden temp file next to `dst`,
@@ -444,16 +327,6 @@ fn atomic_place(src: &Path, dst: &Path) -> std::io::Result<()> {
         let _ = fs::remove_file(&tmp);
     }
     result.map(|_| ())
-}
-
-fn progress_bar(len: u64) -> ProgressBar {
-    let pb = ProgressBar::new(len);
-    if let Ok(style) = ProgressStyle::with_template(
-        "{spinner:.green} [{elapsed_precise}] [{bar:32.cyan/blue}] {pos}/{len} {msg}",
-    ) {
-        pb.set_style(style.progress_chars("\u{2588}\u{2592}\u{2591}"));
-    }
-    pb
 }
 
 #[cfg(test)]
@@ -501,6 +374,24 @@ mod tests {
         (lib, staging, Template::parse("{filename}.{ext}").unwrap(), index)
     }
 
+    fn no_sink(_: &Event) {}
+
+    fn place_item(
+        item: &ImportItem,
+        input: &Path,
+        root: &Path,
+        mode: Mode,
+        overwrite: bool,
+    ) -> ImportSummary {
+        let plan = ImportPlan {
+            input: input.to_path_buf(),
+            root: root.to_path_buf(),
+            template: "{filename}.{ext}".to_string(),
+            items: vec![item.clone()],
+        };
+        execute(&plan, mode, overwrite, &no_sink)
+    }
+
     #[test]
     fn new_duplicate_and_conflict() {
         let (lib, staging, template, mut index) = setup("ndc");
@@ -512,7 +403,7 @@ mod tests {
         write_tagged(&staging.join("exists.mp3"), "A", "T", 100);
 
         let files = scan_audio(&staging);
-        let items: Vec<Item> = files
+        let items: Vec<ImportItem> = files
             .iter()
             .map(|f| classify_item(f, &lib, &template, &mut index))
             .collect();
@@ -555,7 +446,7 @@ mod tests {
         write_tagged(&staging.join("a-copy.mp3"), "Z", "T", 100);
         write_tagged(&staging.join("b-copy.mp3"), "Z", "T", 100);
         let files = scan_audio(&staging);
-        let items: Vec<Item> = files
+        let items: Vec<ImportItem> = files
             .iter()
             .map(|f| classify_item(f, &lib, &template, &mut index))
             .collect();
@@ -569,10 +460,8 @@ mod tests {
         write_tagged(&staging.join("fresh.mp3"), "B", "T", 100);
         let item = classify_item(&staging.join("fresh.mp3"), &lib, &template, &mut index);
         assert_eq!(item.disposition, Disposition::New);
-        assert_eq!(
-            place(std::slice::from_ref(&item), Mode::Move, false),
-            0
-        );
+        let summary = place_item(&item, &staging, &lib, Mode::Move, false);
+        assert_eq!(summary, ImportSummary { placed: 1, failed: 0 });
 
         let dst = item.dst.clone().unwrap();
         assert!(dst.is_file());
@@ -596,7 +485,8 @@ mod tests {
         assert_eq!(item.disposition, Disposition::Conflict);
 
         let dst = item.dst.clone().unwrap();
-        assert_eq!(place(std::slice::from_ref(&item), Mode::Copy, true), 0);
+        let summary = place_item(&item, &staging, &lib, Mode::Copy, true);
+        assert_eq!(summary, ImportSummary { placed: 1, failed: 0 });
         // the library file now carries the incoming content, byte for byte
         assert_eq!(
             fs::read(&dst).unwrap(),
@@ -618,7 +508,8 @@ mod tests {
         assert_eq!(matched, lib.join("exists.mp3"));
         let incoming = fs::read(staging.join("renamed.mp3")).unwrap();
 
-        assert_eq!(place(std::slice::from_ref(&item), Mode::Move, true), 0);
+        let summary = place_item(&item, &staging, &lib, Mode::Move, true);
+        assert_eq!(summary, ImportSummary { placed: 1, failed: 0 });
         // the library keeps its path but carries the incoming content
         assert_eq!(fs::read(&matched).unwrap(), incoming);
         // move mode + replacement: the incoming file is consumed, and no
@@ -635,7 +526,34 @@ mod tests {
         let item = classify_item(&lib.join("exists.mp3"), &lib, &template, &mut index);
         assert_eq!(item.disposition, Disposition::Conflict);
         let before = fs::read(lib.join("exists.mp3")).unwrap();
-        assert_eq!(place(std::slice::from_ref(&item), Mode::Copy, true), 0);
+        let summary = place_item(&item, &staging, &lib, Mode::Copy, true);
+        assert_eq!(summary, ImportSummary { placed: 0, failed: 0 });
         assert_eq!(fs::read(lib.join("exists.mp3")).unwrap(), before);
+    }
+
+    #[test]
+    fn plan_serialization_round_trips() {
+        let (lib, staging, template, mut index) = setup("serde");
+        write_tagged(&staging.join("fresh.mp3"), "B", "T", 100);
+        write_tagged(&staging.join("same.mp3"), "A", "T", 100);
+        let files = scan_audio(&staging);
+        let items: Vec<ImportItem> = files
+            .iter()
+            .map(|f| classify_item(f, &lib, &template, &mut index))
+            .collect();
+        let plan = ImportPlan {
+            input: staging.clone(),
+            root: lib.clone(),
+            template: "{filename}.{ext}".to_string(),
+            items,
+        };
+        let json = serde_json::to_string(&plan).unwrap();
+        let back: ImportPlan = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.items.len(), plan.items.len());
+        assert_eq!(back.items[0].disposition, plan.items[0].disposition);
+        // and the round-tripped plan is executable
+        let summary = execute(&back, Mode::Copy, false, &no_sink);
+        assert_eq!(summary.failed, 0);
+        assert_eq!(summary.placed, 1);
     }
 }

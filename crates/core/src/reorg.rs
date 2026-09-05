@@ -2,7 +2,6 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use clap::Args;
 use indicatif::{ProgressBar, ProgressStyle};
 use serde::{Deserialize, Serialize};
 
@@ -10,33 +9,13 @@ use crate::scan::{file_name, scan_audio};
 use crate::tags::{self, TrackMeta};
 use crate::template::{RenderValues, Template};
 
-#[derive(Args)]
 pub struct ReorgOpts {
-    /// music library folder to reorganize
-    #[arg(long, value_name = "DIR", required_unless_present = "from")]
-    root: Option<PathBuf>,
-
-    /// destination layout relative to the root; placeholders: {artist},
-    /// {title}, {album}, {filename} (original name), {ext}
-    #[arg(long, value_name = "TEMPLATE", default_value = "{artist}/{filename}.{ext}")]
-    template: String,
-
-    /// actually move the files (default: analyze only and write the plan)
-    #[arg(long)]
-    execute: bool,
-
-    /// execute a previously generated plan json instead of analyzing again
-    #[arg(long, value_name = "FILE")]
-    from: Option<PathBuf>,
-
-    /// also apply renames (rekordbox relocates files by filename, so renamed
-    /// files have to be relinked by hand afterwards)
-    #[arg(long)]
-    allow_rename: bool,
-
-    /// plan json written by the analysis (and read back with --from)
-    #[arg(long, value_name = "FILE", default_value = "reorg-plan.json")]
-    plan: PathBuf,
+    pub root: Option<PathBuf>,
+    pub template: String,
+    pub execute: bool,
+    pub from: Option<PathBuf>,
+    pub allow_rename: bool,
+    pub plan: PathBuf,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -76,7 +55,9 @@ struct Plan {
     duplicates: Vec<DupeGroup>,
 }
 
-pub fn cmd_reorg(opts: ReorgOpts) -> i32 {
+/// Run the reorg command: prints its own report/progress and returns the CLI
+/// exit code. (Not yet migrated to the event sink; see lib.rs.)
+pub fn run(opts: ReorgOpts) -> i32 {
     if opts.from.is_some() && !opts.execute {
         eprintln!("--from only makes sense together with --execute");
         return 2;

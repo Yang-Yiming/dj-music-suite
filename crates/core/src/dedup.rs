@@ -3,7 +3,6 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
-use clap::{Args, ValueEnum};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -14,43 +13,18 @@ use crate::tags;
 /// same artist + title with durations within this delta counts as one song
 const DURATION_TOLERANCE_SECS: u64 = 2;
 
-#[derive(Args)]
 pub struct DedupOpts {
-    /// music library folder to deduplicate
-    #[arg(long, value_name = "DIR", required_unless_present = "from")]
-    root: Option<PathBuf>,
-
-    /// actually move/delete the duplicate files (default: analyze only and
-    /// write the plan)
-    #[arg(long)]
-    execute: bool,
-
-    /// execute a previously generated plan json instead of analyzing again
-    #[arg(long, value_name = "FILE")]
-    from: Option<PathBuf>,
-
-    /// which copy to keep in each group: best scores format, bitrate,
-    /// sample rate, cover art, lyrics and tag completeness; first keeps the
-    /// first file in scan order
-    #[arg(long, value_enum, default_value_t = KeepMode::Best)]
-    keep: KeepMode,
-
-    /// folder to move duplicates into (default: <root>/.dedup-trash)
-    #[arg(long, value_name = "DIR")]
-    trash: Option<PathBuf>,
-
-    /// delete duplicates outright instead of moving them into the trash
-    /// folder (irreversible)
-    #[arg(long)]
-    delete: bool,
-
-    /// plan json written by the analysis (and read back with --from)
-    #[arg(long, value_name = "FILE", default_value = "dedup-plan.json")]
-    plan: PathBuf,
+    pub root: Option<PathBuf>,
+    pub execute: bool,
+    pub from: Option<PathBuf>,
+    pub keep: KeepMode,
+    pub trash: Option<PathBuf>,
+    pub delete: bool,
+    pub plan: PathBuf,
 }
 
-#[derive(Clone, Copy, PartialEq, ValueEnum)]
-enum KeepMode {
+#[derive(Clone, Copy, PartialEq)]
+pub enum KeepMode {
     Best,
     First,
 }
@@ -126,7 +100,9 @@ struct Plan {
     cache: BTreeMap<String, CachedFile>,
 }
 
-pub fn cmd_dedup(opts: DedupOpts) -> i32 {
+/// Run the dedup command: prints its own report/progress and returns the CLI
+/// exit code. (Not yet migrated to the event sink; see lib.rs.)
+pub fn run(opts: DedupOpts) -> i32 {
     if opts.from.is_some() && !opts.execute {
         eprintln!("--from only makes sense together with --execute");
         return 2;

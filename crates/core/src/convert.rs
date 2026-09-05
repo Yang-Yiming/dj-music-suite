@@ -4,32 +4,28 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread;
 
-use clap::Args;
 use id3::TagLike;
-use indicatif::{ProgressBar, ProgressStyle};
 
-#[derive(Args)]
+use crate::{usage, Event, Error, Result, Sink};
+
 pub struct ConvertOpts {
-    /// folder containing .ncm files
-    #[arg(long, value_name = "DIR")]
-    input: PathBuf,
-
-    /// folder to write converted audio files to
-    #[arg(long, value_name = "DIR")]
-    output: PathBuf,
-
-    /// number of parallel conversions
-    #[arg(long, value_name = "N", default_value_t = 8)]
-    threads: usize,
-
+    pub input: PathBuf,
+    pub output: PathBuf,
+    pub threads: usize,
     /// folder with track-<musicId> covers (default: <input>/meta); downloaded
     /// covers are cached here
-    #[arg(long, value_name = "DIR")]
-    meta_dir: Option<PathBuf>,
-
+    pub meta_dir: Option<PathBuf>,
     /// never fetch missing covers from the albumPic URL
-    #[arg(long)]
-    no_download: bool,
+    pub no_download: bool,
+}
+
+/// Outcome of a conversion run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConvertSummary {
+    pub total: usize,
+    /// files that got any tags written (cover / basic tags / lyrics)
+    pub tagged: usize,
+    pub failed: usize,
 }
 
 fn is_ncm(p: &Path) -> bool {
@@ -39,7 +35,7 @@ fn is_ncm(p: &Path) -> bool {
         .unwrap_or(false)
 }
 
-fn collect_ncm_files(dir: &Path) -> Result<Vec<PathBuf>, String> {
+fn collect_ncm_files(dir: &Path) -> std::result::Result<Vec<PathBuf>, String> {
     if !dir.is_dir() {
         return Err(format!("input is not a directory: {}", dir.display()));
     }
@@ -221,7 +217,7 @@ fn dechunk(body: &[u8]) -> Vec<u8> {
     out
 }
 
-fn http_get(url: &str) -> Result<Vec<u8>, String> {
+fn http_get(url: &str) -> std::result::Result<Vec<u8>, String> {
     use std::io::{Read, Write};
     // No TLS stack on purpose: the NetEase image CDN serves identical content
     // over plain HTTP, so https cover urls are simply downgraded.
@@ -344,7 +340,8 @@ fn tag_file(
     meta_json: &[u8],
     embedded_image: Option<ncm_core::image::Image>,
     ctx: &TagCtx,
-) -> Result<Option<String>, String> {
+    sink: Sink,
+) -> std::result::Result<Option<String>, String> {
     let mut lyrics = None;
     let lrc_path = src.with_extension("lrc");
     if lrc_path.is_file() {
@@ -355,7 +352,10 @@ fn tag_file(
                     lyrics = Some(normalized);
                 }
             }
-            Err(e) => eprintln!("[warn] cannot read {}: {e}", lrc_path.display()),
+            Err(e) => sink(&Event::Warn(format!(
+                "[warn] cannot read {}: {e}",
+                lrc_path.display()
+            ))),
         }
     }
 
@@ -401,7 +401,7 @@ fn tag_file(
                     ));
                     cover_data = Some(data);
                 }
-                Err(e) => eprintln!("[warn] {}: {e}", src.display()),
+                Err(e) => sink(&Event::Warn(format!("[warn] {}: {e}", src.display()))),
             }
         }
     }
@@ -463,7 +463,12 @@ fn tag_file(
     Ok(Some(summary.join(", ")))
 }
 
-fn convert_one(src: &Path, out_dir: &Path, tag_ctx: &TagCtx, pb: &ProgressBar) -> Result<bool, String> {
+fn convert_one(
+    src: &Path,
+    out_dir: &Path,
+    tag_ctx: &TagCtx,
+    sink: Sink,
+) -> std::result::Result<bool, String> {
     let stem = src
         .file_stem()
         .and_then(|s| s.to_str())
@@ -479,42 +484,42 @@ fn convert_one(src: &Path, out_dir: &Path, tag_ctx: &TagCtx, pb: &ProgressBar) -
         .map_err(|e| format!("cannot create {}: {e}", out_path.display()))?;
     std::io::copy(&mut decoder.audio, &mut out)
         .map_err(|e| format!("writing {} failed: {e}", out_path.display()))?;
-    pb.println(format!("[ok] {} -> {}", src.display(), out_path.display()));
+    sink(&Event::Line(format!(
+        "[ok] {} -> {}",
+        src.display(),
+        out_path.display()
+    )));
 
     let embedded_image = decoder.image.take();
-    match tag_file(&out_path, src, &decoder.meta, embedded_image, tag_ctx) {
+    match tag_file(&out_path, src, &decoder.meta, embedded_image, tag_ctx, sink) {
         Ok(Some(msg)) => {
-            pb.println(format!("[tag] {}: {msg}", out_path.display()));
+            sink(&Event::Line(format!("[tag] {}: {msg}", out_path.display())));
             Ok(true)
         }
         Ok(None) => Ok(false),
         Err(e) => {
-            pb.println(format!("[warn] {}: tagging skipped: {e}", out_path.display()));
+            sink(&Event::Line(format!(
+                "[warn] {}: tagging skipped: {e}",
+                out_path.display()
+            )));
             Ok(false)
         }
     }
 }
 
-pub fn cmd_convert(opts: ConvertOpts) -> i32 {
+pub fn run(opts: ConvertOpts, sink: Sink) -> Result<ConvertSummary> {
     if opts.threads == 0 {
-        eprintln!("--threads must be at least 1");
-        return 2;
+        return Err(usage("--threads must be at least 1"));
     }
-    let files = match collect_ncm_files(&opts.input) {
-        Ok(f) => f,
-        Err(e) => {
-            eprintln!("{e}");
-            return 2;
-        }
-    };
+    let files = collect_ncm_files(&opts.input).map_err(usage)?;
     if files.is_empty() {
-        eprintln!("no .ncm files found in {}", opts.input.display());
-        return 1;
+        return Err(Error::Runtime(format!(
+            "no .ncm files found in {}",
+            opts.input.display()
+        )));
     }
-    if let Err(e) = fs::create_dir_all(&opts.output) {
-        eprintln!("cannot create output dir {}: {e}", opts.output.display());
-        return 2;
-    }
+    fs::create_dir_all(&opts.output)
+        .map_err(|e| usage(format!("cannot create output dir {}: {e}", opts.output.display())))?;
 
     // meta_dir is always resolved (even when the folder does not exist yet) so
     // downloaded covers can be cached into it on the first run.
@@ -524,12 +529,7 @@ pub fn cmd_convert(opts: ConvertOpts) -> i32 {
         allow_download: !opts.no_download,
     };
 
-    let pb = ProgressBar::new(files.len() as u64);
-    if let Ok(style) = ProgressStyle::with_template(
-        "{spinner:.green} [{elapsed_precise}] [{bar:32.cyan/blue}] {pos}/{len} ({eta}) {msg}",
-    ) {
-        pb.set_style(style.progress_chars("\u{2588}\u{2592}\u{2591}"));
-    }
+    sink(&Event::Start(files.len() as u64));
 
     let files = Arc::new(files);
     let out_dir = Arc::new(opts.output);
@@ -546,29 +546,26 @@ pub fn cmd_convert(opts: ConvertOpts) -> i32 {
                     break;
                 }
                 let src = &files[i];
-                pb.set_message(src.display().to_string());
-                match convert_one(src, &out_dir, &tag_ctx, &pb) {
+                match convert_one(src, &out_dir, &tag_ctx, sink) {
                     Ok(true) => {
                         tagged.fetch_add(1, Ordering::SeqCst);
                     }
                     Ok(false) => {}
                     Err(e) => {
-                        pb.println(format!("[fail] {}: {e}", src.display()));
+                        sink(&Event::Line(format!("[fail] {}: {e}", src.display())));
                         failed.fetch_add(1, Ordering::SeqCst);
                     }
                 }
-                pb.inc(1);
+                sink(&Event::Step(src.display().to_string()));
             });
         }
     });
 
     let failed = failed.load(Ordering::SeqCst);
     let tagged = tagged.load(Ordering::SeqCst);
-    let ok = files.len() - failed;
-    pb.finish_and_clear();
-    println!("done: {ok} converted, {tagged} tagged, {failed} failed");
-    if failed > 0 {
-        return 1;
-    }
-    0
+    Ok(ConvertSummary {
+        total: files.len(),
+        tagged,
+        failed,
+    })
 }
