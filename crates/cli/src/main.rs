@@ -34,6 +34,19 @@ enum Commands {
     Reorg(ReorgArgs),
     /// find and remove duplicate files in a music library (analyze by default)
     Dedup(DedupArgs),
+    /// start the local web UI in the browser
+    Serve(ServeArgs),
+}
+
+#[derive(clap::Args)]
+struct ServeArgs {
+    /// port to listen on (127.0.0.1 only)
+    #[arg(long, value_name = "PORT", default_value_t = 8765)]
+    port: u16,
+
+    /// do not open the browser automatically
+    #[arg(long)]
+    no_open: bool,
 }
 
 #[derive(clap::Args)]
@@ -268,6 +281,7 @@ fn main() {
         Some(Commands::Import(args)) => cmd_import(args, &sink),
         Some(Commands::Reorg(args)) => cmd_reorg(args),
         Some(Commands::Dedup(args)) => cmd_dedup(args),
+        Some(Commands::Serve(args)) => cmd_serve(args),
         None => {
             let _ = Cli::command().print_help();
             0
@@ -342,6 +356,19 @@ fn cmd_dedup(args: DedupArgs) -> i32 {
         delete: args.delete,
         plan: args.plan,
     })
+}
+
+fn cmd_serve(args: ServeArgs) -> i32 {
+    match dj_music_server::serve(dj_music_server::ServeOpts {
+        port: args.port,
+        open_browser: !args.no_open,
+    }) {
+        Ok(()) => 0,
+        Err(e) => {
+            eprintln!("{e}");
+            1
+        }
+    }
 }
 
 fn print_import_report(plan: &core_import::ImportPlan, mode: CoreMode, overwrite: bool) {

@@ -50,7 +50,7 @@ pub struct ImportItem {
 
 /// Serializable result of analyzing an import batch: enough to render a
 /// preview (web UI) and to drive [`execute`] afterwards.
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct ImportPlan {
     pub input: PathBuf,
     pub root: PathBuf,
