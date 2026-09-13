@@ -20,7 +20,7 @@ pub struct ReorgOpts {
     pub plan: Option<PathBuf>,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct PlanEntry {
     pub src: PathBuf,
     pub dst: Option<PathBuf>,
@@ -32,7 +32,7 @@ pub struct PlanEntry {
     pub note: Option<String>,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct DupeFile {
     pub path: PathBuf,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -41,14 +41,14 @@ pub struct DupeFile {
     pub size: Option<u64>,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct DupeGroup {
     pub artist: String,
     pub title: String,
     pub files: Vec<DupeFile>,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct Plan {
     pub root: PathBuf,
     pub template: String,
@@ -99,10 +99,16 @@ pub fn execute(opts: &ReorgOpts, sink: Sink) -> Result<ReorgSummary> {
             Template::parse(&opts.template).map_err(|e| usage(format!("bad --template: {e}")))?;
         build_plan(&root, &template, &opts.template, sink)
     };
+    Ok(execute_plan(&plan, opts.allow_rename, sink))
+}
 
+/// Apply an already analyzed plan (CLI: through [`execute`]; web: the plan
+/// kept in memory). Only "ready" entries move; renames are skipped unless
+/// `allow_rename`.
+pub fn execute_plan(plan: &Plan, allow_rename: bool, sink: Sink) -> ReorgSummary {
     let actionable: Vec<&PlanEntry> = plan.entries.iter().filter(|e| e.status == "ready").collect();
     let mut deferred_renames = 0usize;
-    if !opts.allow_rename {
+    if !allow_rename {
         deferred_renames = actionable.iter().filter(|e| e.op.contains("rename")).count();
     }
 
@@ -113,7 +119,7 @@ pub fn execute(opts: &ReorgOpts, sink: Sink) -> Result<ReorgSummary> {
     let mut failed = 0usize;
     for entry in &actionable {
         let is_rename = entry.op.contains("rename");
-        if is_rename && !opts.allow_rename {
+        if is_rename && !allow_rename {
             sink(&Event::Step(String::new()));
             continue;
         }
@@ -145,14 +151,14 @@ pub fn execute(opts: &ReorgOpts, sink: Sink) -> Result<ReorgSummary> {
         }
         sink(&Event::Step(file_name(src)));
     }
-    Ok(ReorgSummary {
-        root: plan.root,
+    ReorgSummary {
+        root: plan.root.clone(),
         moved,
         renamed,
         skipped,
         deferred_renames,
         failed,
-    })
+    }
 }
 
 fn write_plan(plan: &Plan, plan_path: &Path, sink: Sink) {
@@ -414,6 +420,46 @@ mod tests {
         assert_eq!(summary.moved, 1);
         assert_eq!(summary.failed, 0);
         assert!(root.join("Artist/song.mp3").is_file());
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn execute_plan_defers_renames_unless_allowed() {
+        let root = tmpdir("exec-rename");
+        fs::create_dir_all(root.join("Artist")).unwrap();
+        write_tagged(&root.join("Artist/song.mp3"), "Artist", Some("Title"));
+        let plan = analyze(&opts(&root, "{artist}/{artist} - {title}.{ext}"), &no_sink).unwrap();
+        assert_eq!(plan.entries[0].op, "rename");
+
+        let summary = execute_plan(&plan, false, &no_sink);
+        assert_eq!(summary.renamed, 0);
+        assert_eq!(summary.deferred_renames, 1);
+        assert!(root.join("Artist/song.mp3").is_file());
+
+        let summary = execute_plan(&plan, true, &no_sink);
+        assert_eq!(summary.renamed, 1);
+        assert!(root.join("Artist/Artist - Title.mp3").is_file());
+        assert!(!root.join("Artist/song.mp3").exists());
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn execute_plan_skips_when_target_appeared() {
+        let root = tmpdir("exec-skip");
+        write_tagged(&root.join("song.mp3"), "Artist", None);
+        let plan = analyze(&opts(&root, "{artist}/{filename}.{ext}"), &no_sink).unwrap();
+        assert_eq!(plan.entries[0].status, "ready");
+
+        // the destination shows up between analysis and execution
+        fs::create_dir_all(root.join("Artist")).unwrap();
+        fs::write(root.join("Artist/song.mp3"), b"occupied").unwrap();
+
+        let summary = execute_plan(&plan, false, &no_sink);
+        assert_eq!(summary.moved, 0);
+        assert_eq!(summary.failed, 0);
+        assert_eq!(summary.skipped, 1);
+        assert!(root.join("song.mp3").is_file());
+        assert_eq!(fs::read(root.join("Artist/song.mp3")).unwrap(), b"occupied");
         fs::remove_dir_all(&root).unwrap();
     }
 }

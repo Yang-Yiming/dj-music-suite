@@ -13,6 +13,7 @@ path = "src/main.rs"
 [dependencies]
 dj-music-core = { path = "../core" }
 axum = { version = "0.8", features = ["multipart"] }
+parking_lot = "0.12"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "sync", "fs", "io-util"] }
 tokio-stream = "0.1"
 serde = { version = "1.0.229", features = ["derive"] }

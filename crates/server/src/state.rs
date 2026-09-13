@@ -1,9 +1,13 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+
+use parking_lot::Mutex;
 
 use dj_music_core::config::{self, Config, Paths};
+use dj_music_core::dedup as core_dedup;
 use dj_music_core::import::ImportPlan;
+use dj_music_core::reorg as core_reorg;
 
 /// One job at a time (the core operations take over whole staging dirs and
 /// the library index; parallel jobs would just fight each other).
@@ -12,6 +16,10 @@ pub enum JobKind {
     Convert,
     ImportAnalyze,
     ImportExecute,
+    ReorgAnalyze,
+    ReorgExecute,
+    DedupAnalyze,
+    DedupExecute,
 }
 
 impl JobKind {
@@ -20,6 +28,10 @@ impl JobKind {
             JobKind::Convert => "convert",
             JobKind::ImportAnalyze => "import-analyze",
             JobKind::ImportExecute => "import-execute",
+            JobKind::ReorgAnalyze => "reorg-analyze",
+            JobKind::ReorgExecute => "reorg-execute",
+            JobKind::DedupAnalyze => "dedup-analyze",
+            JobKind::DedupExecute => "dedup-execute",
         }
     }
 }
@@ -50,11 +62,11 @@ pub struct JobLog {
 
 impl JobLog {
     fn push(&self, value: serde_json::Value) {
-        self.events.lock().unwrap().push(value);
+        self.events.lock().push(value);
     }
 
     pub fn snapshot(&self) -> Vec<serde_json::Value> {
-        self.events.lock().unwrap().clone()
+        self.events.lock().clone()
     }
 }
 
@@ -68,12 +80,24 @@ pub struct Job {
     pub error: Mutex<Option<String>>,
 }
 
+/// Analysis kept in memory between the analyze and execute requests of the
+/// reorg/dedup tabs. The hash/score cache outlives the plan: it is what makes
+/// re-scanning after an execution cheap, so it is kept in its own slot.
+#[derive(Default)]
+pub struct LibraryPlans {
+    pub reorg: Option<core_reorg::Plan>,
+    pub dedup: Option<(core_dedup::Plan, core_dedup::DedupStats)>,
+    pub dedup_cache: std::collections::BTreeMap<String, core_dedup::CachedFile>,
+}
+
 pub struct AppState {
     pub paths: Paths,
     pub config: Mutex<Config>,
     pub job: Mutex<Option<Job>>,
     /// analyzed import plans by staging id, consumed by import/execute
     pub plans: Mutex<HashMap<String, ImportPlan>>,
+    /// analyzed reorg/dedup plans (library-wide, no staging involved)
+    pub library: Mutex<LibraryPlans>,
 }
 
 impl AppState {
@@ -84,13 +108,13 @@ impl AppState {
             config,
             job: Mutex::new(None),
             plans: Mutex::new(HashMap::new()),
+            library: Mutex::new(LibraryPlans::default()),
         }
     }
 
     pub fn library_root(&self) -> Option<PathBuf> {
         self.config
             .lock()
-            .unwrap()
             .library_root
             .as_ref()
             .map(PathBuf::from)
@@ -112,7 +136,7 @@ pub fn start_job(
     staging_id: Option<String>,
     run: impl FnOnce(dj_music_core::Sink) -> Result<serde_json::Value, String> + Send + 'static,
 ) -> Result<(), String> {
-    let mut slot = state.job.lock().unwrap();
+    let mut slot = state.job.lock();
     if slot.as_ref().is_some_and(|j| j.status == JobStatus::Running) {
         return Err("有任务正在运行，请等待它完成".to_string());
     }
@@ -139,15 +163,15 @@ pub fn start_job(
             log.push(event_json(&shorten_event(event, staging_prefix.as_deref())));
         };
         let outcome = run(&sink);
-        let mut slot = state.job.lock().unwrap();
+        let mut slot = state.job.lock();
         if let Some(job) = slot.as_mut() {
             match outcome {
                 Ok(result) => {
-                    *job.result.lock().unwrap() = Some(result);
+                    *job.result.lock() = Some(result);
                     job.status = JobStatus::Done;
                 }
                 Err(message) => {
-                    *job.error.lock().unwrap() = Some(message);
+                    *job.error.lock() = Some(message);
                     job.status = JobStatus::Failed;
                 }
             }

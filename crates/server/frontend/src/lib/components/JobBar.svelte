@@ -6,6 +6,10 @@
     convert: "正在转换 NCM",
     "import-analyze": "正在分析导入",
     "import-execute": "正在写入曲库",
+    "reorg-analyze": "正在分析整理计划",
+    "reorg-execute": "正在整理曲库",
+    "dedup-analyze": "正在扫描重复文件",
+    "dedup-execute": "正在移出重复文件",
   };
 </script>
 

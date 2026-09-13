@@ -84,7 +84,7 @@ pub struct CachedFile {
     pub score: ScoreDetail,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct Group {
     /// "identical" (same content hash) or "same-identity" (same normalized
     /// artist + title within the duration tolerance)
@@ -95,7 +95,7 @@ pub struct Group {
     pub losers: Vec<FileEntry>,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct Plan {
     pub root: PathBuf,
     pub groups: Vec<Group>,
@@ -124,12 +124,22 @@ pub struct DedupSummary {
 /// Measure every file, group the duplicates and optionally write the plan
 /// json (which also seeds the next run's hash/score cache).
 pub fn analyze(opts: &DedupOpts, sink: Sink) -> Result<(Plan, DedupStats)> {
+    analyze_reusing(opts, load_cache(opts.plan.as_deref()), sink)
+}
+
+/// Like [`analyze`], but reuses a hash/score cache handed in by the caller.
+/// The web UI keeps the previous analysis in memory, so re-running with
+/// another keep mode never re-hashes the library.
+pub fn analyze_reusing(
+    opts: &DedupOpts,
+    mut cache: BTreeMap<String, CachedFile>,
+    sink: Sink,
+) -> Result<(Plan, DedupStats)> {
     let root = config::resolve_library_root(opts.root.as_deref())?;
     let trash_dir = opts
         .trash
         .clone()
         .unwrap_or_else(|| root.join(".dedup-trash"));
-    let mut cache = load_cache(opts.plan.as_deref());
 
     let files: Vec<PathBuf> = scan_audio(&root)
         .into_iter()
@@ -207,10 +217,21 @@ pub fn execute(opts: &DedupOpts, sink: Sink) -> Result<DedupSummary> {
             cache,
         }
     };
+    Ok(execute_plan(&plan, opts.delete, opts.trash.as_deref(), sink))
+}
 
-    let trash = opts
-        .trash
-        .clone()
+/// Remove the losers of an already analyzed plan (CLI: through [`execute`];
+/// web: the plan kept in memory, with keepers possibly reassigned). Never
+/// touches a group whose keeper is gone. `trash` defaults to
+/// `<root>/.dedup-trash`; `delete` removes losers outright instead.
+pub fn execute_plan(
+    plan: &Plan,
+    delete: bool,
+    trash: Option<&Path>,
+    sink: Sink,
+) -> DedupSummary {
+    let trash = trash
+        .map(|p| p.to_path_buf())
         .unwrap_or_else(|| plan.root.join(".dedup-trash"));
     sink(&Event::Start(plan.groups.len() as u64));
     let mut removed = 0usize;
@@ -235,7 +256,7 @@ pub fn execute(opts: &DedupOpts, sink: Sink) -> Result<DedupSummary> {
                 skipped += 1;
                 continue;
             }
-            let res = if opts.delete {
+            let res = if delete {
                 fs::remove_file(&loser.path).map(|_| "deleted".to_string())
             } else {
                 move_to_trash(&loser.path, &trash, &group.kind)
@@ -258,13 +279,13 @@ pub fn execute(opts: &DedupOpts, sink: Sink) -> Result<DedupSummary> {
         }
         sink(&Event::Step(file_name(&group.keep.path)));
     }
-    Ok(DedupSummary {
-        root: plan.root,
+    DedupSummary {
+        root: plan.root.clone(),
         removed,
         skipped,
         failed,
         freed_bytes: freed,
-    })
+    }
 }
 
 fn write_plan(plan: &Plan, plan_path: &Path, sink: Sink) {
@@ -696,6 +717,34 @@ mod tests {
         assert_eq!(summary.skipped, 1);
         let after: Vec<PathBuf> = scan_audio(&root);
         assert_eq!(before, after, "nothing must be deleted without the keeper");
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn execute_plan_honors_reassigned_keeper_and_custom_trash() {
+        let root = tmpdir("reassign");
+        write_tagged(&root.join("a.mp3"), "A", "T", 100);
+        write_tagged(&root.join("cover.mp3"), "A", "T", 100);
+        add_cover(&root.join("cover.mp3"));
+
+        let (mut plan, _) = analyze(&exec_opts(&root, false), &no_sink).unwrap();
+        assert_eq!(plan.groups[0].keep.path, root.join("cover.mp3"));
+
+        // the web UI lets the user pick another keeper per group: demote the
+        // scored winner and promote a.mp3
+        let g = &mut plan.groups[0];
+        g.losers.push(g.keep.clone());
+        let chosen = g.losers.iter().position(|l| l.path == root.join("a.mp3")).unwrap();
+        g.keep = g.losers.remove(chosen);
+
+        let trash = root.join("custom-trash");
+        let summary = execute_plan(&plan, false, Some(&trash), &no_sink);
+        assert_eq!(summary.removed, 1);
+        assert_eq!(summary.failed, 0);
+        assert!(summary.freed_bytes > 0);
+        assert!(root.join("a.mp3").is_file(), "the reassigned keeper must stay");
+        assert!(!root.join("cover.mp3").exists());
+        assert!(trash.join("same-identity/cover.mp3").is_file());
         fs::remove_dir_all(&root).unwrap();
     }
 }

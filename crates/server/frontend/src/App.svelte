@@ -2,9 +2,12 @@
   import { onMount } from "svelte";
   import { fileBasename, getConfig, setConfig } from "./lib/api";
   import { restore } from "./lib/batch.svelte";
+  import { restoreLibrary } from "./lib/library.svelte";
   import ConvertPanel from "./lib/components/ConvertPanel.svelte";
+  import DedupPanel from "./lib/components/DedupPanel.svelte";
   import ImportPanel from "./lib/components/ImportPanel.svelte";
   import JobBar from "./lib/components/JobBar.svelte";
+  import ReorgPanel from "./lib/components/ReorgPanel.svelte";
   import SettingsModal from "./lib/components/SettingsModal.svelte";
 
   type Tab = "convert" | "import" | "reorg" | "dedup";
@@ -34,6 +37,9 @@
     }
     const focus = await restore();
     if (focus) tab = focus;
+    // a reorg/dedup job or a plan analyzed earlier in this server session
+    const libraryFocus = await restoreLibrary();
+    if (libraryFocus) tab = libraryFocus;
   });
 
   const tabButton = (active: boolean) =>
@@ -103,30 +109,18 @@
       <ImportPanel goConvert={() => (tab = "convert")} />
     </section>
   {:else if tab === "reorg"}
-    <section class="mt-4 rounded-2xl border border-slate-200 bg-white p-6">
+    <section class={cardClass(true)}>
       <h2 class="font-semibold">整理曲库</h2>
-      <p class="mt-2 text-sm text-slate-600">
-        把曲库里的文件按标签布局重新归位（{`{artist}/{filename}.{ext}`} 之类的目录模板），
-        先分析出移动计划，确认后执行，rekordbox 里一键 Relocate 即可。
-      </p>
-      <p class="mt-3 rounded-lg bg-slate-50 p-3 text-xs text-slate-500">
-        Web 版开发中。当前可在终端使用：
-        <code class="font-mono text-slate-700">dj-music-suite reorg --root &lt;曲库&gt;</code>
-        （<code class="font-mono">--execute</code> 应用计划）
-      </p>
+      <ReorgPanel
+        {libraryRoot}
+        onNeedSettings={() => (settingsOpen = true)}
+        goDedup={() => (tab = "dedup")}
+      />
     </section>
   {:else if tab === "dedup"}
-    <section class="mt-4 rounded-2xl border border-slate-200 bg-white p-6">
+    <section class={cardClass(true)}>
       <h2 class="font-semibold">查找重复</h2>
-      <p class="mt-2 text-sm text-slate-600">
-        扫描曲库里的重复文件：内容完全相同的直接归组，同一首歌的多个版本按音质评分保留最好的一份，
-        其余移入回收目录，确认无误后再删除。
-      </p>
-      <p class="mt-3 rounded-lg bg-slate-50 p-3 text-xs text-slate-500">
-        Web 版开发中。当前可在终端使用：
-        <code class="font-mono text-slate-700">dj-music-suite dedup --root &lt;曲库&gt;</code>
-        （<code class="font-mono">--execute</code> 移入回收目录）
-      </p>
+      <DedupPanel {libraryRoot} onNeedSettings={() => (settingsOpen = true)} />
     </section>
   {/if}
 </main>

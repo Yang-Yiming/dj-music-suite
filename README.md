@@ -114,10 +114,11 @@ running `dj-music-suite-web` for UI iteration.
 
 ## web ui
 
-A local web UI covering the two flows non-CLI users need: converting `.ncm`
-files and importing music into the library. Everything stays on the machine —
-the server listens on `127.0.0.1` only, and files are uploaded into a local
-staging folder (never sent anywhere).
+A local web UI covering the flows non-CLI users need: converting `.ncm`
+files, importing music into the library, reorganizing it and removing
+duplicates. Everything stays on the machine — the server listens on
+`127.0.0.1` only, and files are uploaded into a local staging folder (never
+sent anywhere).
 
 ```bash
 ./target/release/dj-music-suite-web [--port 8765] [--no-open]
@@ -132,6 +133,27 @@ duplicate / conflict / untagged — and writes to the library only after an
 explicit confirmation (the same analyze → execute two-phase design as the
 CLI). Progress streams live into the page. `--no-open` skips launching the
 browser automatically.
+
+The 整理 (reorg) and 去重 (dedup) tabs run the CLI's other two commands on the
+configured library root, with the same analyze → review → execute split:
+
+- **整理** analyzes the root against a directory template and lists every file
+  as move / rename / move+rename / in place / conflict / untagged, plus the
+  same suspicious-duplicate groups the CLI reports. Rows are ticked per file;
+  only plain moves are ticked by default, because rekordbox relinks relocated
+  files by file name — a rename needs `--allow-rename` in the CLI and a
+  manual relink afterwards, so the web UI makes it an explicit per-row opt-in
+  (with a warning next to it). Executing applies exactly the ticked rows.
+- **去重** hashes the library and groups duplicates (identical content, or the
+  same artist + title within the duration tolerance), keeping one file per
+  group: the best-scoring one, or — per group — whichever the user picks.
+  Removals only ever move losers into `<root>/.dedup-trash/<kind>/`; the web
+  UI never deletes outright (`--delete` stays a CLI-only, irreversible
+  option). Groups whose keeper is gone are left untouched, as in the CLI.
+
+Both keep the analyzed plan in server memory (the hash/score cache is reused
+when re-scanning), so a page reload restores the plan and any running job's
+progress, while restarting the server means analyzing again.
 
 Workspace layout: `crates/core` (UI-agnostic logic, event sink + structured
 results), `crates/cli` (argument parsing + terminal rendering),

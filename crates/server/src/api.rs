@@ -1,4 +1,5 @@
-use std::path::Path;
+use std::collections::BTreeSet;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use axum::extract::{Multipart, Path as AxPath, State};
@@ -10,7 +11,9 @@ use axum::Router;
 use serde_json::json;
 
 use dj_music_core::convert::{self, ConvertOpts};
+use dj_music_core::dedup as core_dedup;
 use dj_music_core::import::{self as core_import, Mode};
+use dj_music_core::reorg as core_reorg;
 
 use crate::state::{start_job, JobKind, JobStatus, AppState};
 
@@ -32,6 +35,12 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/convert", post(start_convert))
         .route("/api/import/analyze", post(import_analyze))
         .route("/api/import/execute", post(import_execute))
+        .route("/api/reorg/analyze", post(reorg_analyze))
+        .route("/api/reorg/execute", post(reorg_execute))
+        .route("/api/reorg/plan", get(reorg_plan))
+        .route("/api/dedup/analyze", post(dedup_analyze))
+        .route("/api/dedup/execute", post(dedup_execute))
+        .route("/api/dedup/plan", get(dedup_plan))
         .route("/api/job", get(job_snapshot))
         .route("/api/events", get(events))
         .route("/api/staging/{id}", delete(clear_staging))
@@ -85,7 +94,7 @@ use axum::Json;
 // ---------- config ----------
 
 async fn get_config(State(state): State<Arc<AppState>>) -> Response {
-    let config = state.config.lock().unwrap();
+    let config = state.config.lock();
     Json(json!({
         "library_root": config.library_root,
     }))
@@ -112,7 +121,7 @@ async fn set_config(State(state): State<Arc<AppState>>, Json(body): Json<serde_j
         Err(e) => return bad_request(e),
     };
     {
-        let mut config = state.config.lock().unwrap();
+        let mut config = state.config.lock();
         config.library_root = Some(canonical.clone());
         if let Err(e) = dj_music_core::config::save(&state.paths.config_file, &config) {
             return bad_request(format!("保存配置失败: {e}"));
@@ -445,7 +454,7 @@ async fn import_analyze(
     let sid = staging_id.clone();
     let result = start_job(&state, JobKind::ImportAnalyze, Some(staging_id), move |sink: dj_music_core::Sink| {
         let plan = core_import::analyze(&dir, Some(&root), &template, sink).map_err(|e| e.to_string())?;
-        state2.plans.lock().unwrap().insert(sid, plan.clone());
+        state2.plans.lock().insert(sid, plan.clone());
         serde_json::to_value(&plan).map_err(|e| e.to_string())
     });
     match result {
@@ -473,7 +482,7 @@ async fn import_execute(
             .filter_map(|x| x.as_str().map(str::to_string))
             .collect()
     });
-    let plan = state.plans.lock().unwrap().get(&staging_id).cloned();
+    let plan = state.plans.lock().get(&staging_id).cloned();
     let Some(mut plan) = plan else {
         return bad_request("请先运行导入分析");
     };
@@ -497,7 +506,7 @@ async fn import_execute(
             if let Some(dir) = &staging_dir {
                 let _ = std::fs::remove_dir_all(dir);
             }
-            state2.plans.lock().unwrap().remove(&sid);
+            state2.plans.lock().remove(&sid);
         }
         Ok(json!({
             "placed": summary.placed,
@@ -511,10 +520,267 @@ async fn import_execute(
     }
 }
 
+// ---------- reorg / dedup ----------
+//
+// Both operate on the configured library root (no staging) and follow the
+// same analyze -> review -> execute shape as import: the analysis is kept in
+// memory and the execute request only refers to it, never to a client
+// supplied path list, so the HTTP surface can't be talked into moving or
+// deleting files the user never saw.
+
+fn library_root_or_error(state: &AppState) -> Result<PathBuf, Response> {
+    state
+        .library_root()
+        .ok_or_else(|| bad_request("请先在设置里指定曲库根目录"))
+}
+
+/// The reorg plan is exactly what the preview table needs (root, template,
+/// entries, suspected duplicates), so it goes out as-is.
+fn reorg_plan_json(plan: &core_reorg::Plan) -> serde_json::Value {
+    json!({
+        "root": plan.root,
+        "template": plan.template,
+        "entries": plan.entries,
+        "duplicates": plan.duplicates,
+    })
+}
+
+/// Dedup plan minus the hash/score cache: that map is large and the browser
+/// renders neither part of it.
+fn dedup_plan_json(plan: &core_dedup::Plan, stats: core_dedup::DedupStats) -> serde_json::Value {
+    json!({
+        "root": plan.root,
+        "groups": plan.groups,
+        "stats": { "scanned": stats.scanned, "unreadable": stats.unreadable },
+    })
+}
+
+async fn reorg_analyze(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<serde_json::Value>,
+) -> Response {
+    let root = match library_root_or_error(&state) {
+        Ok(root) => root,
+        Err(resp) => return resp,
+    };
+    let template = body
+        .get("template")
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+        .unwrap_or_else(|| "{artist}/{filename}.{ext}".to_string());
+
+    let state2 = Arc::clone(&state);
+    let result = start_job(
+        &state,
+        JobKind::ReorgAnalyze,
+        None,
+        move |sink: dj_music_core::Sink| {
+            let opts = core_reorg::ReorgOpts {
+                root: Some(root),
+                template,
+                execute: false,
+                from: None,
+                allow_rename: false,
+                // no plan file for the web UI: the plan stays in memory
+                plan: None,
+            };
+            let plan = core_reorg::analyze(&opts, sink).map_err(|e| e.to_string())?;
+            let value = reorg_plan_json(&plan);
+            state2.library.lock().reorg = Some(plan);
+            Ok(value)
+        },
+    );
+    match result {
+        Ok(()) => Json(json!({"started": true})).into_response(),
+        Err(e) => conflict(e),
+    }
+}
+
+async fn reorg_execute(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<serde_json::Value>,
+) -> Response {
+    let Some(items) = body.get("include").and_then(|v| v.as_array()) else {
+        return bad_request("缺少 include（要应用的条目列表）");
+    };
+    let include: BTreeSet<PathBuf> = items
+        .iter()
+        .filter_map(|v| v.as_str())
+        .map(PathBuf::from)
+        .collect();
+    let plan = state.library.lock().reorg.clone();
+    let Some(plan) = plan else {
+        return bad_request("请先运行整理分析");
+    };
+
+    let state2 = Arc::clone(&state);
+    let result = start_job(
+        &state,
+        JobKind::ReorgExecute,
+        None,
+        move |sink: dj_music_core::Sink| {
+            // apply exactly the ticked rows; renames included, because a tick
+            // on a rename row is the explicit opt-in the CLI spells --allow-rename
+            let mut plan = plan;
+            plan.entries.retain(|e| include.contains(&e.src));
+            let summary = core_reorg::execute_plan(&plan, true, sink);
+            // the plan described the library as it was: drop it so a reload
+            // can't restore a table of moves that already happened
+            state2.library.lock().reorg = None;
+            Ok(json!({
+                "root": summary.root,
+                "moved": summary.moved,
+                "renamed": summary.renamed,
+                "skipped": summary.skipped,
+                "deferred_renames": summary.deferred_renames,
+                "failed": summary.failed,
+            }))
+        },
+    );
+    match result {
+        Ok(()) => Json(json!({"started": true})).into_response(),
+        Err(e) => conflict(e),
+    }
+}
+
+async fn reorg_plan(State(state): State<Arc<AppState>>) -> Response {
+    let plan = state
+        .library
+        .lock()
+        .reorg
+        .as_ref()
+        .map(reorg_plan_json);
+    Json(json!({ "plan": plan })).into_response()
+}
+
+async fn dedup_analyze(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<serde_json::Value>,
+) -> Response {
+    let root = match library_root_or_error(&state) {
+        Ok(root) => root,
+        Err(resp) => return resp,
+    };
+    let keep = match body.get("keep").and_then(|v| v.as_str()) {
+        Some("first") => core_dedup::KeepMode::First,
+        _ => core_dedup::KeepMode::Best,
+    };
+    // seed from the previous scan so re-running (another keep mode, or a
+    // fresher scan) reuses the hashes instead of reading the whole library
+    let seed = std::mem::take(&mut state.library.lock().dedup_cache);
+
+    let state2 = Arc::clone(&state);
+    let result = start_job(
+        &state,
+        JobKind::DedupAnalyze,
+        None,
+        move |sink: dj_music_core::Sink| {
+            let opts = core_dedup::DedupOpts {
+                root: Some(root),
+                execute: false,
+                from: None,
+                keep,
+                trash: None,
+                delete: false,
+                plan: None,
+            };
+            let (mut plan, stats) =
+                core_dedup::analyze_reusing(&opts, seed, sink).map_err(|e| e.to_string())?;
+            let value = dedup_plan_json(&plan, stats);
+            let mut library = state2.library.lock();
+            // the cache lives on its own so executing (which discards the
+            // plan) does not throw away the expensive part
+            library.dedup_cache = std::mem::take(&mut plan.cache);
+            library.dedup = Some((plan, stats));
+            Ok(value)
+        },
+    );
+    match result {
+        Ok(()) => Json(json!({"started": true})).into_response(),
+        Err(e) => conflict(e),
+    }
+}
+
+async fn dedup_execute(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<serde_json::Value>,
+) -> Response {
+    let plan = state
+        .library
+        .lock()
+        .dedup
+        .as_ref()
+        .map(|(plan, _)| plan.clone());
+    let Some(mut plan) = plan else {
+        return bad_request("请先运行去重分析");
+    };
+
+    // "keepers" maps a group index to the file that must survive; groups
+    // absent from the map keep the keeper the analysis chose. Resolving it
+    // here keeps a bad request a 400 instead of a failed job.
+    if let Some(map) = body.get("keepers").and_then(|v| v.as_object()) {
+        for (index, value) in map {
+            let Ok(index) = index.parse::<usize>() else {
+                return bad_request(format!("组号无效: {index}"));
+            };
+            let Some(path) = value.as_str() else {
+                return bad_request("keepers 的值必须是文件路径");
+            };
+            let Some(group) = plan.groups.get_mut(index) else {
+                return bad_request(format!("组号越界: {index}"));
+            };
+            let mut files: Vec<core_dedup::FileEntry> = std::iter::once(group.keep.clone())
+                .chain(group.losers.iter().cloned())
+                .collect();
+            let Some(position) = files.iter().position(|f| f.path == Path::new(path)) else {
+                return bad_request(format!("该文件不在第 {index} 组里: {path}"));
+            };
+            group.keep = files.remove(position);
+            group.losers = files;
+        }
+    }
+
+    let state2 = Arc::clone(&state);
+    let result = start_job(
+        &state,
+        JobKind::DedupExecute,
+        None,
+        move |sink: dj_music_core::Sink| {
+            // web never deletes outright: losers go to <root>/.dedup-trash
+            let trash = plan.root.join(".dedup-trash");
+            let summary = core_dedup::execute_plan(&plan, false, None, sink);
+            // groups describe the library as it was; the hash cache stays
+            state2.library.lock().dedup = None;
+            Ok(json!({
+                "root": summary.root,
+                "removed": summary.removed,
+                "skipped": summary.skipped,
+                "failed": summary.failed,
+                "freed_bytes": summary.freed_bytes,
+                "trash": trash,
+            }))
+        },
+    );
+    match result {
+        Ok(()) => Json(json!({"started": true})).into_response(),
+        Err(e) => conflict(e),
+    }
+}
+
+async fn dedup_plan(State(state): State<Arc<AppState>>) -> Response {
+    let plan = state
+        .library
+        .lock()
+        .dedup
+        .as_ref()
+        .map(|(plan, stats)| dedup_plan_json(plan, *stats));
+    Json(json!({ "plan": plan })).into_response()
+}
+
 // ---------- job status ----------
 
 async fn job_snapshot(State(state): State<Arc<AppState>>) -> Response {
-    let guard = state.job.lock().unwrap();
+    let guard = state.job.lock();
     let Some(job) = guard.as_ref() else {
         return Json(json!({"status": "idle"})).into_response();
     };
@@ -523,8 +789,8 @@ async fn job_snapshot(State(state): State<Arc<AppState>>) -> Response {
         "staging_id": job.staging_id,
         "status": job.status.as_str(),
         "events": job.log.snapshot(),
-        "result": *job.result.lock().unwrap(),
-        "error": *job.error.lock().unwrap(),
+        "result": *job.result.lock(),
+        "error": *job.error.lock(),
     }))
     .into_response()
 }
@@ -539,19 +805,19 @@ async fn events(State(state): State<Arc<AppState>>) -> impl axum::response::Into
         let mut ticks = 0u32;
         loop {
             let snapshot = {
-                let guard = state.job.lock().unwrap();
+                let guard = state.job.lock();
                 match guard.as_ref() {
                     Some(job) => {
                         let all = job.log.snapshot();
                         let fresh = all.into_iter().skip(sent).collect::<Vec<_>>();
                         let status = job.status;
                         let result = if status == JobStatus::Done {
-                            job.result.lock().unwrap().clone()
+                            job.result.lock().clone()
                         } else {
                             None
                         };
                         let error = if status == JobStatus::Failed {
-                            job.error.lock().unwrap().clone()
+                            job.error.lock().clone()
                         } else {
                             None
                         };
@@ -605,14 +871,14 @@ async fn clear_staging(State(state): State<Arc<AppState>>, AxPath(id): AxPath<St
     };
     // never touch files that are still referenced by a running job
     {
-        let guard = state.job.lock().unwrap();
+        let guard = state.job.lock();
         if let Some(job) = guard.as_ref() {
             if job.status == JobStatus::Running && job.staging_id.as_deref() == Some(id.as_str()) {
                 return conflict("该暂存目录正被任务使用");
             }
         }
     }
-    state.plans.lock().unwrap().remove(&id);
+    state.plans.lock().remove(&id);
     match tokio::fs::remove_dir_all(&dir).await {
         Ok(()) => Json(json!({"cleared": true})).into_response(),
         Err(e) => bad_request(format!("清理失败: {e}")),

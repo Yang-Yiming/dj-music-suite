@@ -20,6 +20,13 @@ import {
 } from "./api";
 import { job, resumeRunningJob, watchJob } from "./job.svelte";
 
+/// Job kinds this store drives (upload batch -> convert -> import).
+const OWNED_KINDS: Partial<Record<JobSnapshot["kind"], true>> = {
+  convert: true,
+  "import-analyze": true,
+  "import-execute": true,
+};
+
 export const batch = $state<{
   stagingId: string | null;
   /** registered local folder (read in place, not uploaded) */
@@ -233,6 +240,9 @@ export async function restore(): Promise<"convert" | "import" | null> {
     return null;
   }
   if (!("kind" in snapshot)) return null;
+  // reorg/dedup jobs belong to the library store: claiming them here would
+  // steal their event stream and focus the wrong tab
+  if (!OWNED_KINDS[snapshot.kind]) return null;
   if (snapshot.staging_id) batch.stagingId = snapshot.staging_id;
   if (snapshot.status === "running") {
     const kind = snapshot.kind;

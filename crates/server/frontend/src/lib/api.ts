@@ -53,12 +53,110 @@ export type EndPayload =
   | { type: "idle" };
 
 export interface JobSnapshot {
-  kind: "convert" | "import-analyze" | "import-execute";
+  kind: JobKind;
   staging_id: string | null;
   status: "running" | "done" | "failed";
   events: JobEvent[];
   result: unknown;
   error: string | null;
+}
+
+export type JobKind =
+  | "convert"
+  | "import-analyze"
+  | "import-execute"
+  | "reorg-analyze"
+  | "reorg-execute"
+  | "dedup-analyze"
+  | "dedup-execute";
+
+// ---------- reorg ----------
+
+/** "move", "rename", "move+rename" or "none" */
+export type ReorgOp = "move" | "rename" | "move+rename" | "none";
+/** "ready", "in-place", "conflict" or "untagged" */
+export type ReorgStatus = "ready" | "in-place" | "conflict" | "untagged";
+
+export interface ReorgEntry {
+  src: string;
+  dst?: string;
+  op: ReorgOp;
+  status: ReorgStatus;
+  note?: string;
+}
+
+export interface ReorgDupeFile {
+  path: string;
+  duration_secs?: number;
+  size?: number;
+}
+
+export interface ReorgDupeGroup {
+  artist: string;
+  title: string;
+  files: ReorgDupeFile[];
+}
+
+export interface ReorgPlan {
+  root: string;
+  template: string;
+  entries: ReorgEntry[];
+  duplicates: ReorgDupeGroup[];
+}
+
+export interface ReorgResult {
+  root: string;
+  moved: number;
+  renamed: number;
+  skipped: number;
+  deferred_renames: number;
+  failed: number;
+}
+
+// ---------- dedup ----------
+
+export interface DedupScore {
+  format_rank: number;
+  bitrate?: number;
+  sample_rate?: number;
+  bits_per_sample?: number;
+  has_cover: boolean;
+  has_lyrics: boolean;
+  tags_complete: boolean;
+  score: number;
+}
+
+export interface DedupFile {
+  path: string;
+  size: number;
+  mtime_secs: number;
+  sha256: string;
+  score: DedupScore;
+  duration_secs?: number;
+  identity?: [string, string];
+}
+
+export interface DedupGroup {
+  /** "identical" (same content hash) or "same-identity" */
+  kind: "identical" | "same-identity";
+  identity?: [string, string];
+  keep: DedupFile;
+  losers: DedupFile[];
+}
+
+export interface DedupPlan {
+  root: string;
+  groups: DedupGroup[];
+  stats: { scanned: number; unreadable: number };
+}
+
+export interface DedupResult {
+  root: string;
+  removed: number;
+  skipped: number;
+  failed: number;
+  freed_bytes: number;
+  trash: string;
 }
 
 export class ApiError extends Error {
@@ -154,6 +252,88 @@ export const startExecute = (
 
 export const getJob = () =>
   call<JobSnapshot | { status: "idle" }>("/api/job");
+
+// ---------- reorg / dedup ----------
+
+export const startReorgAnalyze = (template: string) =>
+  call<{ started: boolean }>("/api/reorg/analyze", {
+    method: "POST",
+    headers: jsonHeaders,
+    body: JSON.stringify({ template }),
+  });
+
+/// `include` = the src paths ticked in the preview table; the server applies
+/// exactly those (and never anything else).
+export const startReorgExecute = (include: string[]) =>
+  call<{ started: boolean }>("/api/reorg/execute", {
+    method: "POST",
+    headers: jsonHeaders,
+    body: JSON.stringify({ include }),
+  });
+
+export const getReorgPlan = () =>
+  call<{ plan: ReorgPlan | null }>("/api/reorg/plan");
+
+export const startDedupAnalyze = (keep: "best" | "first") =>
+  call<{ started: boolean }>("/api/dedup/analyze", {
+    method: "POST",
+    headers: jsonHeaders,
+    body: JSON.stringify({ keep }),
+  });
+
+/// `keepers` maps a group index to the path that must survive; groups left
+/// out keep the keeper the analysis chose.
+export const startDedupExecute = (keepers: Record<number, string>) =>
+  call<{ started: boolean }>("/api/dedup/execute", {
+    method: "POST",
+    headers: jsonHeaders,
+    body: JSON.stringify({ keepers }),
+  });
+
+export const getDedupPlan = () =>
+  call<{ plan: DedupPlan | null }>("/api/dedup/plan");
+
+export const REORG_STATUS_LABELS: Record<ReorgStatus, string> = {
+  "ready": "待处理",
+  "in-place": "已就位",
+  "conflict": "目标已存在",
+  "untagged": "缺标签",
+};
+
+export const REORG_OP_LABELS: Record<ReorgOp, string> = {
+  "move": "移动",
+  "rename": "重命名",
+  "move+rename": "移动+重命名",
+  "none": "不动",
+};
+
+export const DEDUP_KIND_LABELS: Record<DedupGroup["kind"], string> = {
+  identical: "内容相同",
+  "same-identity": "同曲异版",
+};
+
+/// Rows the reorg table ticks by default: only what can actually move, and
+/// never a rename (rekordbox relinks by file name, so renaming forces a
+/// manual relink). Renames become available once ticked explicitly.
+export const reorgDefaultIncluded = (entry: ReorgEntry): boolean =>
+  entry.status === "ready" && entry.op === "move";
+
+export const reorgIsRename = (entry: ReorgEntry): boolean =>
+  entry.op === "rename" || entry.op === "move+rename";
+
+export const formatBytes = (bytes: number): string => {
+  if (bytes >= 1024 ** 3) return `${(bytes / 1024 ** 3).toFixed(2)} GB`;
+  if (bytes >= 1024 ** 2) return `${(bytes / 1024 ** 2).toFixed(1)} MB`;
+  if (bytes >= 1024) return `${(bytes / 1024).toFixed(0)} KB`;
+  return `${bytes} B`;
+};
+
+export const formatDuration = (secs?: number): string => {
+  if (secs === undefined) return "—";
+  const m = Math.floor(secs / 60);
+  const s = secs % 60;
+  return `${m}:${String(s).padStart(2, "0")}`;
+};
 
 export const clearStaging = (id: string) =>
   call<{ cleared: boolean }>(`/api/staging/${id}`, { method: "DELETE" });
