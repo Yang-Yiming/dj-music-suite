@@ -12,6 +12,8 @@ cargo build --release
 ./target/release/dj-music-suite convert --input <DIR> --output <DIR>
 ./target/release/dj-music-suite import --input <DIR> --root <MUSIC_DIR>
 ./target/release/dj-music-suite reorg --root <MUSIC_DIR>
+./target/release/dj-music-suite dedup --root <MUSIC_DIR>
+./target/release/dj-music-suite trash --root <MUSIC_DIR>
 ./target/release/dj-music-suite-web   # web UI as a separate binary, opens the browser
 ```
 
@@ -20,7 +22,7 @@ the command overview, `help convert` (or `convert --help`) prints all options,
 and missing required arguments print the usage along with the error. Omitting
 the subcommand (`./dj-music-suite --input <DIR> ...`) still runs `convert`.
 
-`import`, `reorg` and `dedup` operate on the music library root: pass
+`import`, `reorg`, `dedup` and `trash` operate on the music library root: pass
 `--root` explicitly, or omit it to use the library root configured in the
 web UI (stored in the app config dir).
 
@@ -96,6 +98,58 @@ The analysis classifies every file: `move` / `rename` / `move+rename`,
 artist + title). Only `move` entries execute by default; renames need
 `--allow-rename`; conflicts and untagged files are never touched.
 
+## dedup
+
+Finds and removes duplicates. Files with identical content are grouped by
+hash; the rest are grouped by normalized artist + title when their durations
+are within 2 s (so different mixes stay separate). Each group keeps one file:
+`--keep best` scores format (lossless first), bitrate, sample rate, bit depth,
+cover art, lyrics and tag completeness; `--keep first` keeps the first in scan
+order. Losers are moved into `<root>/.dedup-trash/<kind>/` unless `--delete`
+is given.
+
+```bash
+./target/release/dj-music-suite dedup --root <MUSIC_DIR>              # analyze, writes dedup-plan.json
+./target/release/dj-music-suite dedup --root <MUSIC_DIR> --execute    # move losers into the trash
+./target/release/dj-music-suite dedup --root <MUSIC_DIR> --execute --delete  # remove them for good
+```
+
+| Option | Description |
+| --- | --- |
+| `--execute` | actually move/delete duplicates (default: analyze only) |
+| `--from <FILE>` | execute a previously generated plan json instead of re-analyzing |
+| `--keep <best\|first>` | which copy survives in each group (default `best`) |
+| `--trash <DIR>` | folder to move duplicates into (default `<root>/.dedup-trash`) |
+| `--delete` | delete duplicates outright instead of moving them to the trash (irreversible) |
+| `--plan <FILE>` | plan json path (default `dedup-plan.json`); also seeds the hash cache of the next run |
+
+The plan file doubles as a cache keyed by path + mtime + size, so re-running
+against an unchanged library skips re-hashing. A group whose keeper is gone is
+left untouched: it might be the only surviving copy of the song.
+
+### trash
+
+Every file dedup moves out gets a record of where it came from, appended to
+`<root>/.dedup-trash/manifest.json` (by the CLI and the web UI alike). Without
+it a trashed `track01.flac` is just a name — and its `track01-1.flac` sibling
+is a guess — so restoring would be guesswork.
+
+```bash
+# list the trash
+./target/release/dj-music-suite trash --root <MUSIC_DIR>
+# put entries back where they came from (entry names as printed above)
+./target/release/dj-music-suite trash --root <MUSIC_DIR> --restore 'identical/song.mp3'
+# or delete what you no longer need
+./target/release/dj-music-suite trash --root <MUSIC_DIR> --delete 'identical/song.mp3'
+./target/release/dj-music-suite trash --root <MUSIC_DIR> --empty
+```
+
+Restore never overwrites: a target that is occupied again is skipped and
+reported, because rekordbox relinks by path and silently choosing a different
+name is worse than staying put. Files with no manifest record (dropped in by
+hand, or trashed before the manifest existed) are listed as unknown origin:
+they can be deleted, but not restored.
+
 ## Building
 
 ```bash
@@ -154,6 +208,17 @@ configured library root, with the same analyze → review → execute split:
 Both keep the analyzed plan in server memory (the hash/score cache is reused
 when re-scanning), so a page reload restores the plan and any running job's
 progress, while restarting the server means analyzing again.
+
+### dedup trash
+
+The 去重 tab lists the trash below the duplicate groups: original location,
+group kind, size and age, with restore / delete per selection and
+restore-all / empty for the whole folder. The manifest that makes restoring
+possible is written by core, so files trashed by
+`dj-music-suite dedup --execute` show up here with their origins intact (see
+[trash](#trash) for the command line equivalent). Restore never overwrites: an
+occupied target is skipped and reported. Files with no manifest record are
+listed as unknown origin — deletable, not restorable.
 
 Workspace layout: `crates/core` (UI-agnostic logic, event sink + structured
 results), `crates/cli` (argument parsing + terminal rendering),

@@ -68,7 +68,9 @@ export type JobKind =
   | "reorg-analyze"
   | "reorg-execute"
   | "dedup-analyze"
-  | "dedup-execute";
+  | "dedup-execute"
+  | "trash-restore"
+  | "trash-delete";
 
 // ---------- reorg ----------
 
@@ -156,6 +158,37 @@ export interface DedupResult {
   skipped: number;
   failed: number;
   freed_bytes: number;
+  trash: string;
+}
+
+// ---------- trash ----------
+
+export interface TrashEntry {
+  /** key for restore/delete: path inside the trash folder */
+  rel: string;
+  kind: string;
+  size: number;
+  moved_at?: number;
+  sha256?: string;
+  /** where it came from; absent for entries with no manifest record */
+  original?: string;
+  path: string;
+  restorable: boolean;
+}
+
+export interface TrashListing {
+  root: string;
+  trash: string;
+  entries: TrashEntry[];
+  bytes: number;
+}
+
+export interface TrashResult {
+  restored?: number;
+  removed?: number;
+  skipped: number;
+  failed: number;
+  bytes: number;
   trash: string;
 }
 
@@ -292,6 +325,39 @@ export const startDedupExecute = (keepers: Record<number, string>) =>
 
 export const getDedupPlan = () =>
   call<{ plan: DedupPlan | null }>("/api/dedup/plan");
+
+// ---------- trash ----------
+
+export const getTrash = () => call<TrashListing>("/api/trash");
+
+/// `clear` restores everything at once (unknown-origin files are skipped);
+/// otherwise only the listed entry names are touched.
+export const restoreTrash = (entries: string[], clear: boolean) =>
+  call<{ started: boolean }>("/api/trash/restore", {
+    method: "POST",
+    headers: jsonHeaders,
+    body: JSON.stringify({ entries, clear }),
+  });
+
+export const deleteTrash = (entries: string[], clear: boolean) =>
+  call<{ started: boolean }>("/api/trash/delete", {
+    method: "POST",
+    headers: jsonHeaders,
+    body: JSON.stringify({ entries, clear }),
+  });
+
+export const TRASH_KIND_LABELS: Record<string, string> = {
+  identical: "内容相同",
+  "same-identity": "同曲异版",
+};
+
+export const formatAge = (movedAt?: number, now = Date.now() / 1000): string => {
+  if (!movedAt) return "—";
+  const days = Math.max(0, Math.floor((now - movedAt) / 86400));
+  if (days === 0) return "今天";
+  if (days === 1) return "昨天";
+  return `${days} 天前`;
+};
 
 export const REORG_STATUS_LABELS: Record<ReorgStatus, string> = {
   "ready": "待处理",

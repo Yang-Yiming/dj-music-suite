@@ -3,10 +3,13 @@
 // the analyzed plan in memory and the execute call refers back to it.
 
 import {
+  deleteTrash,
   getDedupPlan,
   getJob,
   getReorgPlan,
+  getTrash,
   reorgDefaultIncluded,
+  restoreTrash,
   startDedupAnalyze,
   startDedupExecute,
   startReorgAnalyze,
@@ -16,6 +19,9 @@ import {
   type JobSnapshot,
   type ReorgPlan,
   type ReorgResult,
+  type TrashEntry,
+  type TrashListing,
+  type TrashResult,
 } from "./api";
 import { resumeRunningJob, watchJob } from "./job.svelte";
 
@@ -60,6 +66,96 @@ export const dedup = $state<{
   result: null,
   executeError: "",
 });
+
+export const trash = $state<{
+  listing: TrashListing | null;
+  /** rel names ticked in the list */
+  selected: Record<string, boolean>;
+  loading: boolean;
+  error: string;
+  busy: boolean;
+  result: TrashResult | null;
+  resultVerb: "restored" | "removed" | null;
+}>({
+  listing: null,
+  selected: {},
+  loading: false,
+  error: "",
+  busy: false,
+  result: null,
+  resultVerb: null,
+});
+
+/// Refresh the trash listing (also used after a dedup run, which adds files).
+export async function refreshTrash() {
+  trash.loading = true;
+  trash.error = "";
+  try {
+    trash.listing = await getTrash();
+    // drop ticks for entries that are no longer there
+    const present = new Set(trash.listing.entries.map((e) => e.rel));
+    for (const rel of Object.keys(trash.selected)) {
+      if (!present.has(rel)) delete trash.selected[rel];
+    }
+  } catch (e) {
+    trash.error = e instanceof Error ? e.message : String(e);
+  } finally {
+    trash.loading = false;
+  }
+}
+
+export const trashSelected = (): TrashEntry[] => {
+  const entries = trash.listing?.entries ?? [];
+  return entries.filter((e) => trash.selected[e.rel]);
+};
+
+/// Run a trash job and refresh the listing afterwards (the job moves or
+/// deletes files, so the old listing is always stale).
+async function runTrashJob(
+  kind: "trash-restore" | "trash-delete",
+  entries: string[],
+  clear: boolean,
+) {
+  trash.busy = true;
+  trash.error = "";
+  trash.result = null;
+  trash.resultVerb = null;
+  try {
+    if (kind === "trash-restore") await restoreTrash(entries, clear);
+    else await deleteTrash(entries, clear);
+    const end = await watchJob(kind);
+    if (end.type === "done") {
+      trash.result = end.result as TrashResult;
+      trash.resultVerb = kind === "trash-restore" ? "restored" : "removed";
+      trash.selected = {};
+      await refreshTrash();
+    } else {
+      trash.error = end.type === "error" ? end.message : "没有收到任务";
+    }
+  } catch (e) {
+    trash.error = e instanceof Error ? e.message : String(e);
+  } finally {
+    trash.busy = false;
+  }
+}
+
+export function restoreSelectedTrash() {
+  const entries = trashSelected();
+  if (entries.length) runTrashJob("trash-restore", entries.map((e) => e.rel), false);
+}
+
+export function deleteSelectedTrash() {
+  const entries = trashSelected();
+  if (entries.length) runTrashJob("trash-delete", entries.map((e) => e.rel), false);
+}
+
+export function restoreAllTrash() {
+  runTrashJob("trash-restore", [], true);
+}
+
+export function clearTrash() {
+  runTrashJob("trash-delete", [], true);
+}
 
 export async function doReorgAnalyze() {
   reorg.error = "";
@@ -193,6 +289,8 @@ export async function doDedupExecute() {
       dedup.result = end.result as DedupResult;
       dedup.plan = null;
       dedup.keepers = {};
+      // the run just added files to the trash
+      refreshTrash();
     } else {
       dedup.executeError = end.type === "error" ? end.message : "没有收到去重任务";
     }
@@ -203,14 +301,31 @@ export async function doDedupExecute() {
   }
 }
 
-function applyReorgEnd(end: { type: string; result?: unknown; message?: string }) {
-  if (end.type === "done") applyReorgPlan(end.result as ReorgPlan);
-  else if (end.type === "error") reorg.error = end.message ?? "任务失败";
+/// Restore the reorg/dedup tab after a page reload (see [`restoreLibrary`]).
+/// The result payloads differ per kind — an analyze yields a plan, an execute
+/// yields a summary — so each kind routes to its own slot; feeding a summary
+/// into the plan would leave the UI reading fields that aren't there.
+function applyReorgFinish(kind: JobSnapshot["kind"], end: { type: string; result?: unknown; message?: string }) {
+  if (end.type === "error") {
+    reorg.error = end.message ?? "任务失败";
+    return;
+  }
+  if (end.type !== "done") return;
+  if (kind === "reorg-analyze") applyReorgPlan(end.result as ReorgPlan);
+  else reorg.result = end.result as ReorgResult;
 }
 
-function applyDedupEnd(end: { type: string; result?: unknown; message?: string }) {
-  if (end.type === "done") applyDedupPlan(end.result as DedupPlan);
-  else if (end.type === "error") dedup.error = end.message ?? "任务失败";
+function applyDedupFinish(kind: JobSnapshot["kind"], end: { type: string; result?: unknown; message?: string }) {
+  if (end.type === "error") {
+    dedup.error = end.message ?? "任务失败";
+    return;
+  }
+  if (end.type !== "done") return;
+  if (kind === "dedup-analyze") applyDedupPlan(end.result as DedupPlan);
+  else {
+    dedup.result = end.result as DedupResult;
+    refreshTrash();
+  }
 }
 
 /// Restore the reorg/dedup tab after a page reload: a still-running job is
@@ -227,39 +342,67 @@ export async function restoreLibrary(): Promise<"reorg" | "dedup" | null> {
   } catch {
     return null;
   }
-  if ("kind" in snapshot && snapshot.kind.startsWith("reorg")) {
+  if ("kind" in snapshot && (snapshot.kind === "reorg-analyze" || snapshot.kind === "reorg-execute")) {
+    const kind = snapshot.kind;
     if (snapshot.status === "running") {
-      const analyzing = snapshot.kind === "reorg-analyze";
-      reorg.waiting = analyzing;
-      reorg.executing = !analyzing;
+      reorg.waiting = kind === "reorg-analyze";
+      reorg.executing = !reorg.waiting;
       resumeRunningJob(snapshot).then((end) => {
         reorg.waiting = false;
         reorg.executing = false;
-        applyReorgEnd(end);
+        applyReorgFinish(kind, end);
       });
+    } else if (snapshot.status === "done") {
+      applyReorgFinish(kind, { type: "done", result: snapshot.result });
     } else {
-      if (snapshot.status === "done") applyReorgEnd({ type: "done", result: snapshot.result });
-      else reorg.error = snapshot.error ?? "任务失败";
+      reorg.error = snapshot.error ?? "任务失败";
     }
     return "reorg";
   }
-  if ("kind" in snapshot && snapshot.kind.startsWith("dedup")) {
+  if ("kind" in snapshot && (snapshot.kind === "dedup-analyze" || snapshot.kind === "dedup-execute")) {
+    const kind = snapshot.kind;
     if (snapshot.status === "running") {
-      const analyzing = snapshot.kind === "dedup-analyze";
-      dedup.waiting = analyzing;
-      dedup.executing = !analyzing;
+      dedup.waiting = kind === "dedup-analyze";
+      dedup.executing = !dedup.waiting;
       resumeRunningJob(snapshot).then((end) => {
         dedup.waiting = false;
         dedup.executing = false;
-        applyDedupEnd(end);
+        applyDedupFinish(kind, end);
       });
+    } else if (snapshot.status === "done") {
+      applyDedupFinish(kind, { type: "done", result: snapshot.result });
     } else {
-      if (snapshot.status === "done") applyDedupEnd({ type: "done", result: snapshot.result });
-      else dedup.error = snapshot.error ?? "任务失败";
+      dedup.error = snapshot.error ?? "任务失败";
     }
     return "dedup";
   }
-  // no job involved: a plan analyzed earlier in this server session
+  if ("kind" in snapshot && (snapshot.kind === "trash-restore" || snapshot.kind === "trash-delete")) {
+    const restoring = snapshot.kind === "trash-restore";
+    const finish = (end: { type: string; result?: unknown; message?: string }) => {
+      trash.busy = false;
+      if (end.type === "done") {
+        trash.result = end.result as TrashResult;
+        trash.resultVerb = restoring ? "restored" : "removed";
+        trash.selected = {};
+      } else if (end.type === "error") {
+        trash.error = end.message ?? "任务失败";
+      }
+      refreshTrash();
+    };
+    if (snapshot.status === "running") {
+      trash.busy = true;
+      resumeRunningJob(snapshot).then(finish);
+    } else if (snapshot.status === "done") {
+      finish({ type: "done", result: snapshot.result });
+    } else {
+      trash.error = snapshot.error ?? "任务失败";
+      refreshTrash();
+    }
+    return "dedup";
+  }
+  // no job involved: a plan analyzed earlier in this server session, plus
+  // whatever is sitting in the trash folder
+  refreshTrash();
   try {
     const [r, d] = await Promise.all([getReorgPlan(), getDedupPlan()]);
     if (r.plan) {

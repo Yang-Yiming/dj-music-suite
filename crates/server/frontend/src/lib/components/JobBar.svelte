@@ -10,6 +10,8 @@
     "reorg-execute": "正在整理曲库",
     "dedup-analyze": "正在扫描重复文件",
     "dedup-execute": "正在移出重复文件",
+    "trash-restore": "正在放回文件",
+    "trash-delete": "正在删除回收站文件",
   };
 </script>
 

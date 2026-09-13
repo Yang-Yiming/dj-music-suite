@@ -14,6 +14,7 @@ use dj_music_core::convert::{self, ConvertOpts};
 use dj_music_core::dedup as core_dedup;
 use dj_music_core::import::{self as core_import, Mode};
 use dj_music_core::reorg as core_reorg;
+use dj_music_core::trash as core_trash;
 
 use crate::state::{start_job, JobKind, JobStatus, AppState};
 
@@ -41,6 +42,9 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/dedup/analyze", post(dedup_analyze))
         .route("/api/dedup/execute", post(dedup_execute))
         .route("/api/dedup/plan", get(dedup_plan))
+        .route("/api/trash", get(trash_list))
+        .route("/api/trash/restore", post(trash_restore))
+        .route("/api/trash/delete", post(trash_delete))
         .route("/api/job", get(job_snapshot))
         .route("/api/events", get(events))
         .route("/api/staging/{id}", delete(clear_staging))
@@ -775,6 +779,150 @@ async fn dedup_plan(State(state): State<Arc<AppState>>) -> Response {
         .as_ref()
         .map(|(plan, stats)| dedup_plan_json(plan, *stats));
     Json(json!({ "plan": plan })).into_response()
+}
+
+// ---------- trash ----------
+//
+// The trash folder is written by dedup (CLI and web alike); the manifest it
+// records is what makes a file restorable, so listing joins the two and flags
+// anything without a record as unknown origin.
+
+/// Absolute trash folder for the configured library root (custom `--trash`
+/// locations are a CLI concern).
+fn trash_dir_or_error(state: &AppState) -> Result<PathBuf, Response> {
+    let root = library_root_or_error(state)?;
+    Ok(core_trash::default_dir(&root))
+}
+
+fn trash_json(trash: &Path, entry: &core_trash::Entry) -> serde_json::Value {
+    json!({
+        "rel": entry.rel,
+        "kind": entry.kind,
+        "size": entry.size,
+        "moved_at": entry.moved_at,
+        "sha256": entry.sha256,
+        "original": entry.original,
+        "path": entry.path,
+        "restorable": entry.original.is_some(),
+        "trash": trash,
+    })
+}
+
+async fn trash_list(State(state): State<Arc<AppState>>) -> Response {
+    let trash = match trash_dir_or_error(&state) {
+        Ok(trash) => trash,
+        Err(resp) => return resp,
+    };
+    let root = match library_root_or_error(&state) {
+        Ok(root) => root,
+        Err(resp) => return resp,
+    };
+    let entries_list = core_trash::list(&root, &trash);
+    let bytes: u64 = entries_list.iter().map(|e| e.size).sum();
+    let entries: Vec<serde_json::Value> = entries_list
+        .iter()
+        .map(|entry| trash_json(&trash, entry))
+        .collect();
+    Json(json!({
+        "root": root,
+        "trash": trash,
+        "entries": entries,
+        "bytes": bytes,
+    }))
+    .into_response()
+}
+
+/// Entry names from the request, rejected unless they name a path inside the
+/// trash folder. `clear: true` means "everything currently in the trash".
+fn trash_targets(
+    state: &AppState,
+    body: &serde_json::Value,
+) -> Result<(PathBuf, PathBuf, bool, Vec<String>), Response> {
+    let root = library_root_or_error(state)?;
+    let trash = core_trash::default_dir(&root);
+    let clear = body.get("clear").and_then(|v| v.as_bool()).unwrap_or(false);
+    let mut entries: Vec<String> = Vec::new();
+    if let Some(list) = body.get("entries").and_then(|v| v.as_array()) {
+        for value in list {
+            let Some(rel) = value.as_str() else {
+                return Err(bad_request("entries 必须是字符串数组"));
+            };
+            if !core_trash::is_safe_rel(rel) {
+                return Err(bad_request(format!("条目名无效: {rel}")));
+            }
+            entries.push(rel.to_string());
+        }
+    }
+    if !clear && entries.is_empty() {
+        return Err(bad_request("缺少 entries（要处理的条目），或设 clear 为 true"));
+    }
+    if clear && !entries.is_empty() {
+        return Err(bad_request("entries 与 clear 不能同时给出"));
+    }
+    Ok((root, trash, clear, entries))
+}
+
+async fn trash_restore(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<serde_json::Value>,
+) -> Response {
+    let (root, trash, clear, entries) = match trash_targets(&state, &body) {
+        Ok(parts) => parts,
+        Err(resp) => return resp,
+    };
+    // "put everything back" only covers what has a remembered origin: files
+    // of unknown origin can't be restored
+    let entries = if clear { core_trash::restorable(&root, &trash) } else { entries };
+    if entries.is_empty() {
+        return bad_request("回收目录里没有可放回的条目");
+    }
+    let result = start_job(&state, JobKind::TrashRestore, None, move |sink: dj_music_core::Sink| {
+        let summary = core_trash::restore(&root, &trash, &entries, sink).map_err(|e| e.to_string())?;
+        Ok(json!({
+            "restored": summary.restored,
+            "skipped": summary.skipped,
+            "failed": summary.failed,
+            "bytes": summary.bytes,
+            "trash": trash,
+        }))
+    });
+    match result {
+        Ok(()) => Json(json!({"started": true})).into_response(),
+        Err(e) => conflict(e),
+    }
+}
+
+async fn trash_delete(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<serde_json::Value>,
+) -> Response {
+    let (_root, trash, clear, entries) = match trash_targets(&state, &body) {
+        Ok(parts) => parts,
+        Err(resp) => return resp,
+    };
+    let result = start_job(
+        &state,
+        JobKind::TrashDelete,
+        None,
+        move |sink: dj_music_core::Sink| {
+            let summary = if clear {
+                core_trash::clear(&trash, sink)
+            } else {
+                core_trash::remove(&trash, &entries, sink).map_err(|e| e.to_string())?
+            };
+            Ok(json!({
+                "removed": summary.removed,
+                "skipped": summary.skipped,
+                "failed": summary.failed,
+                "bytes": summary.bytes,
+                "trash": trash,
+            }))
+        },
+    );
+    match result {
+        Ok(()) => Json(json!({"started": true})).into_response(),
+        Err(e) => conflict(e),
+    }
 }
 
 // ---------- job status ----------

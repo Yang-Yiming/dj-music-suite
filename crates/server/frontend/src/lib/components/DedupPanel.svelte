@@ -19,6 +19,7 @@
   import { job } from "../job.svelte";
   import LogPanel from "./LogPanel.svelte";
   import Progress from "./Progress.svelte";
+  import TrashSection from "./TrashSection.svelte";
 
   let {
     libraryRoot,
@@ -62,8 +63,7 @@
 {:else}
   <p class="mt-2 text-sm text-slate-600">
     扫描整个曲库：内容完全相同的文件直接归组，同一首歌的不同版本按音质评分保留最好的一份。
-    这里只把其余副本移入回收目录（<span class="font-mono text-xs">.dedup-trash</span>），
-    不会直接删除，确认无误后再自己清理。
+    这里只把其余副本移入下方的回收目录，不会直接删除 —— 确认无误后再在回收目录里放回或清空。
   </p>
   <p class="mt-2 truncate text-xs text-slate-400" title={libraryRoot}>曲库：{libraryRoot}</p>
 
@@ -250,8 +250,10 @@
       {formatBytes(dedup.result.freed_bytes)}；跳过 {dedup.result.skipped} 个，失败
       {dedup.result.failed} 个。
       <p class="mt-2 text-xs text-emerald-700">
-        文件都在 <span class="font-mono">{dedup.result.trash}</span> 里，确认无误后自行删除。
+        文件都在回收目录里，确认无误后再删除。
       </p>
     </div>
   {/if}
+
+  <TrashSection />
 {/if}

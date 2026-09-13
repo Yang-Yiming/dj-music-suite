@@ -20,6 +20,8 @@ pub enum JobKind {
     ReorgExecute,
     DedupAnalyze,
     DedupExecute,
+    TrashRestore,
+    TrashDelete,
 }
 
 impl JobKind {
@@ -32,6 +34,8 @@ impl JobKind {
             JobKind::ReorgExecute => "reorg-execute",
             JobKind::DedupAnalyze => "dedup-analyze",
             JobKind::DedupExecute => "dedup-execute",
+            JobKind::TrashRestore => "trash-restore",
+            JobKind::TrashDelete => "trash-delete",
         }
     }
 }

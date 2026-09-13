@@ -10,6 +10,7 @@ use crate::config;
 use crate::quality;
 use crate::scan::{file_name, scan_audio};
 use crate::tags;
+use crate::trash;
 use crate::{usage, Event, Result, Sink};
 
 /// same artist + title with durations within this delta counts as one song
@@ -139,7 +140,7 @@ pub fn analyze_reusing(
     let trash_dir = opts
         .trash
         .clone()
-        .unwrap_or_else(|| root.join(".dedup-trash"));
+        .unwrap_or_else(|| trash::default_dir(&root));
 
     let files: Vec<PathBuf> = scan_audio(&root)
         .into_iter()
@@ -195,7 +196,7 @@ pub fn execute(opts: &DedupOpts, sink: Sink) -> Result<DedupSummary> {
         load_plan(from)?
     } else {
         let root = config::resolve_library_root(opts.root.as_deref())?;
-        let trash_dir = opts.trash.clone().unwrap_or_else(|| root.join(".dedup-trash"));
+        let trash_dir = opts.trash.clone().unwrap_or_else(|| trash::default_dir(&root));
         let mut cache = load_cache(opts.plan.as_deref());
         let files: Vec<PathBuf> = scan_audio(&root)
             .into_iter()
@@ -232,12 +233,15 @@ pub fn execute_plan(
 ) -> DedupSummary {
     let trash = trash
         .map(|p| p.to_path_buf())
-        .unwrap_or_else(|| plan.root.join(".dedup-trash"));
+        .unwrap_or_else(|| trash::default_dir(&plan.root));
     sink(&Event::Start(plan.groups.len() as u64));
     let mut removed = 0usize;
     let mut skipped = 0usize;
     let mut failed = 0usize;
     let mut freed = 0u64;
+    // one write at the end: the manifest is what makes a trashed file
+    // restorable, so the moves and their origins land together
+    let mut moved_records: Vec<trash::Record> = Vec::new();
     for group in &plan.groups {
         // never touch the losers when the keeper is missing: the group might
         // be the only surviving copy of the song
@@ -256,16 +260,32 @@ pub fn execute_plan(
                 skipped += 1;
                 continue;
             }
-            let res = if delete {
-                fs::remove_file(&loser.path).map(|_| "deleted".to_string())
+            // Ok(None) = deleted outright, Ok(Some) = the trash path it landed in
+            let res: std::io::Result<Option<PathBuf>> = if delete {
+                fs::remove_file(&loser.path).map(|_| None)
             } else {
-                move_to_trash(&loser.path, &trash, &group.kind)
-                    .map(|p| format!("-> {}", p.display()))
+                move_to_trash(&loser.path, &trash, &group.kind).map(Some)
             };
             match res {
-                Ok(msg) => {
+                Ok(dst) => {
                     removed += 1;
                     freed += loser.size;
+                    if let Some(dst) = &dst {
+                        if let Some(rel) = trash::relative(&trash, dst) {
+                            moved_records.push(trash::Record {
+                                trash: rel,
+                                original: trash::original_key(&plan.root, &loser.path),
+                                kind: group.kind.clone(),
+                                size: loser.size,
+                                sha256: Some(loser.sha256.clone()),
+                                moved_at: trash::now(),
+                            });
+                        }
+                    }
+                    let msg = match &dst {
+                        Some(dst) => format!("-> {}", dst.display()),
+                        None => "deleted".to_string(),
+                    };
                     sink(&Event::Line(format!(
                         "[ok] {} {}: {}",
                         msg, group.kind, loser.path.display()
@@ -279,6 +299,7 @@ pub fn execute_plan(
         }
         sink(&Event::Step(file_name(&group.keep.path)));
     }
+    trash::append(&trash, &moved_records, sink);
     DedupSummary {
         root: plan.root.clone(),
         removed,
@@ -323,14 +344,8 @@ fn move_to_trash(src: &Path, trash: &Path, kind: &str) -> std::io::Result<PathBu
         dst = dir.join(format!("{stem}-{n}{ext}"));
         n += 1;
     }
-    match fs::rename(src, &dst) {
-        Ok(()) => Ok(dst),
-        Err(_) => {
-            fs::copy(src, &dst)?;
-            fs::remove_file(src)?;
-            Ok(dst)
-        }
-    }
+    crate::trash::move_file(src, &dst)?;
+    Ok(dst)
 }
 
 /// Probe + hash a file, consulting/updating the mtime+size keyed cache.
@@ -680,6 +695,14 @@ mod tests {
         assert!(kept.is_file());
         assert_eq!(summary.removed, 1);
         assert!(summary.freed_bytes > 0);
+
+        // the move is recorded with where the file came from, so it can be
+        // listed and restored later
+        let entries = trash::list(&root, &trash::default_dir(&root));
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].original.as_deref(), Some(lost.as_path()));
+        assert_eq!(entries[0].kind, "same-identity");
+        assert!(entries[0].moved_at.is_some());
 
         // delete mode on a fresh library
         let root2 = tmpdir("exec-del");

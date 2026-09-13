@@ -14,6 +14,7 @@ pub mod reorg;
 pub mod scan;
 pub mod tags;
 pub mod template;
+pub mod trash;
 
 /// Errors that map onto distinct CLI exit codes: usage problems exit 2,
 /// runtime problems exit 1.

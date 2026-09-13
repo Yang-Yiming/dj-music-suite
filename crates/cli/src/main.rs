@@ -9,7 +9,7 @@ use indicatif::{ProgressBar, ProgressStyle};
 
 use dj_music_core::convert::ConvertOpts;
 use dj_music_core::import::{self as core_import, Mode as CoreMode};
-use dj_music_core::{dedup as core_dedup, reorg as core_reorg, Event};
+use dj_music_core::{dedup as core_dedup, reorg as core_reorg, trash as core_trash, Event};
 
 #[derive(Parser)]
 #[command(
@@ -33,6 +33,8 @@ enum Commands {
     Reorg(ReorgArgs),
     /// find and remove duplicate files in a music library (analyze by default)
     Dedup(DedupArgs),
+    /// inspect, restore or empty the dedup trash folder
+    Trash(TrashArgs),
 }
 
 #[derive(clap::Args)]
@@ -188,6 +190,31 @@ enum KeepModeArg {
     First,
 }
 
+#[derive(clap::Args)]
+struct TrashArgs {
+    /// music library folder whose trash folder to operate on (default: the
+    /// library root configured in the web UI)
+    #[arg(long, value_name = "DIR")]
+    root: Option<PathBuf>,
+
+    /// trash folder (default: <root>/.dedup-trash)
+    #[arg(long, value_name = "DIR")]
+    trash: Option<PathBuf>,
+
+    /// put these entries back where they came from (entry names as printed by
+    /// a plain `trash` run); occupied targets are skipped, never overwritten
+    #[arg(long, value_name = "ENTRY", num_args = 1..)]
+    restore: Vec<String>,
+
+    /// permanently delete these entries (irreversible)
+    #[arg(long, value_name = "ENTRY", num_args = 1..)]
+    delete: Vec<String>,
+
+    /// permanently delete everything in the trash folder (irreversible)
+    #[arg(long)]
+    empty: bool,
+}
+
 impl From<KeepModeArg> for core_dedup::KeepMode {
     fn from(k: KeepModeArg) -> Self {
         match k {
@@ -270,6 +297,7 @@ fn main() {
         Some(Commands::Import(args)) => cmd_import(args, &sink),
         Some(Commands::Reorg(args)) => cmd_reorg(args, &sink),
         Some(Commands::Dedup(args)) => cmd_dedup(args, &sink),
+        Some(Commands::Trash(args)) => cmd_trash(args, &sink),
         None => {
             let _ = Cli::command().print_help();
             0
@@ -469,18 +497,115 @@ fn cmd_dedup(args: DedupArgs, sink: &TerminalSink) -> i32 {
                     summary.removed, summary.skipped, summary.failed
                 );
                 if !args.delete && summary.removed > 0 {
-                    let trash = match opts.trash {
-                        Some(t) => t,
-                        None => summary.root.join(".dedup-trash"),
-                    };
+                    let trash = core_trash::default_dir(&summary.root);
                     println!("duplicates were moved to {}", trash.display());
-                    println!("verify in your player, then delete the trash folder.");
+                    println!("review with `trash`, then restore or delete from there.");
                 }
                 i32::from(summary.failed > 0)
             }
             Err(e) => error_code(e),
         }
     }
+}
+
+fn cmd_trash(args: TrashArgs, sink: &TerminalSink) -> i32 {
+    let actions = usize::from(args.empty) + usize::from(!args.restore.is_empty()) + usize::from(!args.delete.is_empty());
+    if actions > 1 {
+        eprintln!("--restore, --delete and --empty are mutually exclusive");
+        return 2;
+    }
+    let root = match dj_music_core::config::resolve_library_root(args.root.as_deref()) {
+        Ok(root) => root,
+        Err(e) => return error_code(e),
+    };
+    let trash = args
+        .trash
+        .clone()
+        .unwrap_or_else(|| core_trash::default_dir(&root));
+    let sink_fn = |e: &Event| sink.sink(e);
+
+    if args.empty {
+        let summary = core_trash::clear(&trash, &sink_fn);
+        sink.finish();
+        let mb = summary.bytes as f64 / (1024.0 * 1024.0);
+        println!(
+            "done: {} files deleted ({mb:.1} MB freed), {} failed",
+            summary.removed, summary.failed
+        );
+        return i32::from(summary.failed > 0);
+    }
+    if !args.restore.is_empty() || !args.delete.is_empty() {
+        let (summary, verb) = if !args.restore.is_empty() {
+            match core_trash::restore(&root, &trash, &args.restore, &sink_fn) {
+                Ok(s) => (s, "restored"),
+                Err(e) => return error_code(e),
+            }
+        } else {
+            match core_trash::remove(&trash, &args.delete, &sink_fn) {
+                Ok(s) => (s, "deleted"),
+                Err(e) => return error_code(e),
+            }
+        };
+        sink.finish();
+        let mb = summary.bytes as f64 / (1024.0 * 1024.0);
+        println!(
+            "done: {} {verb} ({mb:.1} MB), {} skipped, {} failed",
+            if verb == "restored" { summary.restored } else { summary.removed },
+            summary.skipped,
+            summary.failed
+        );
+        if summary.skipped > 0 {
+            println!("skipped entries stay in {}", trash.display());
+        }
+        return i32::from(summary.failed > 0);
+    }
+
+    print_trash_list(&root, &trash);
+    0
+}
+
+fn print_trash_list(root: &std::path::Path, trash: &std::path::Path) {
+    let entries = core_trash::list(root, trash);
+    println!("dedup trash");
+    println!("  folder: {}", trash.display());
+    if entries.is_empty() {
+        println!();
+        println!("  (empty)");
+        return;
+    }
+    let total: u64 = entries.iter().map(|e| e.size).sum();
+    println!(
+        "  {} files, {:.1} MB",
+        entries.len(),
+        total as f64 / (1024.0 * 1024.0)
+    );
+    println!();
+    for entry in &entries {
+        let origin = match &entry.original {
+            Some(path) => path.display().to_string(),
+            None => "(unknown origin, can only be deleted)".to_string(),
+        };
+        let when = entry
+            .moved_at
+            .map(|t| {
+                // days since the move, computed from the unix timestamp
+                let days = core_trash::now().saturating_sub(t) / 86_400;
+                match days {
+                    0 => "today".to_string(),
+                    1 => "yesterday".to_string(),
+                    n => format!("{n} days ago"),
+                }
+            })
+            .unwrap_or_default();
+        println!("  {}", entry.rel);
+        println!("    from: {origin}");
+        if !when.is_empty() {
+            println!("    moved: {when}");
+        }
+    }
+    println!();
+    println!("  --restore <ENTRY>...  put files back   --delete <ENTRY>...  delete permanently");
+    println!("  --empty               delete everything");
 }
 
 fn describe(score: &core_dedup::ScoreDetail) -> String {
