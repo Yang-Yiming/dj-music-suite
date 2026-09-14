@@ -9,14 +9,16 @@
   import JobBar from "./lib/components/JobBar.svelte";
   import ReorgPanel from "./lib/components/ReorgPanel.svelte";
   import SettingsModal from "./lib/components/SettingsModal.svelte";
+  import TranscodePanel from "./lib/components/TranscodePanel.svelte";
 
-  type Tab = "convert" | "import" | "reorg" | "dedup";
+  type Tab = "convert" | "import" | "reorg" | "dedup" | "transcode";
 
   const TABS: { id: Tab; label: string }[] = [
     { id: "convert", label: "转换" },
     { id: "import", label: "导入" },
     { id: "reorg", label: "整理" },
     { id: "dedup", label: "去重" },
+    { id: "transcode", label: "转码" },
   ];
 
   let tab = $state<Tab>("convert");
@@ -37,7 +39,8 @@
     }
     const focus = await restore();
     if (focus) tab = focus;
-    // a reorg/dedup job or a plan analyzed earlier in this server session
+    // a reorg/dedup/transcode job or a plan analyzed earlier in this server
+    // session
     const libraryFocus = await restoreLibrary();
     if (libraryFocus) tab = libraryFocus;
   });
@@ -121,6 +124,11 @@
     <section class={cardClass(true)}>
       <h2 class="font-semibold">查找重复</h2>
       <DedupPanel {libraryRoot} onNeedSettings={() => (settingsOpen = true)} />
+    </section>
+  {:else if tab === "transcode"}
+    <section class={cardClass(true)}>
+      <h2 class="font-semibold">格式转码</h2>
+      <TranscodePanel {libraryRoot} onNeedSettings={() => (settingsOpen = true)} />
     </section>
   {/if}
 </main>

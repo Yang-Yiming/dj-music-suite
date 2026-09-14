@@ -264,7 +264,7 @@ pub fn execute_plan(
             let res: std::io::Result<Option<PathBuf>> = if delete {
                 fs::remove_file(&loser.path).map(|_| None)
             } else {
-                move_to_trash(&loser.path, &trash, &group.kind).map(Some)
+                trash::move_into(&loser.path, &trash, &group.kind).map(Some)
             };
             match res {
                 Ok(dst) => {
@@ -323,29 +323,6 @@ fn write_plan(plan: &Plan, plan_path: &Path, sink: Sink) {
         }
         Err(e) => sink(&Event::Warn(format!("[warn] cannot serialize plan: {e}"))),
     }
-}
-
-/// Move `src` into `<trash>/<kind>/`, keeping the original file name and
-/// uniquifying on collision. Falls back to copy+remove when src and trash
-/// live on different filesystems.
-fn move_to_trash(src: &Path, trash: &Path, kind: &str) -> std::io::Result<PathBuf> {
-    let dir = trash.join(kind);
-    fs::create_dir_all(&dir)?;
-    let name = file_name(src);
-    let ext = src
-        .extension()
-        .and_then(|e| e.to_str())
-        .map(|e| format!(".{e}"))
-        .unwrap_or_default();
-    let stem = name.strip_suffix(&ext).unwrap_or(&name);
-    let mut dst = dir.join(&name);
-    let mut n = 1u32;
-    while dst.exists() {
-        dst = dir.join(format!("{stem}-{n}{ext}"));
-        n += 1;
-    }
-    crate::trash::move_file(src, &dst)?;
-    Ok(dst)
 }
 
 /// Probe + hash a file, consulting/updating the mtime+size keyed cache.

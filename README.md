@@ -1,15 +1,16 @@
 # dj-music-suite
 
 Small tools for DJ music libraries: convert NetEase `.ncm` files to mp3/flac
-with full tags, import new music into a library folder with duplicate
-detection, and reorganize a library folder on disk. Comes as a CLI and a
-local web UI.
+with full tags, transcode existing audio between formats, import new music
+into a library folder with duplicate detection, and reorganize a library
+folder on disk. Comes as a CLI and a local web UI.
 
 ## Usage
 
 ```bash
 cargo build --release
 ./target/release/dj-music-suite convert --input <DIR> --output <DIR>
+./target/release/dj-music-suite transcode --to mp3 --input <DIR>
 ./target/release/dj-music-suite import --input <DIR> --root <MUSIC_DIR>
 ./target/release/dj-music-suite reorg --root <MUSIC_DIR>
 ./target/release/dj-music-suite dedup --root <MUSIC_DIR>
@@ -71,6 +72,64 @@ Typical flow: `convert` into a staging folder, review the import report, then
 `import --execute` and let rekordbox import/refresh the library root — new
 tracks come in with tags and artwork already embedded.
 
+## transcode
+
+Re-encodes existing audio files into another format. Unlike every other
+command this one rewrites the audio instead of moving it, so it is its own
+command with its own analyze → plan → execute pair.
+
+**ffmpeg is required** (the one external dependency in the suite): it is
+looked up on `$PATH`, or passed explicitly with `--ffmpeg`. The target's
+encoder is checked *before* the analysis runs — a build without `libmp3lame`
+refuses `--to mp3` instead of failing halfway or silently degrading. Targets:
+`mp3` (`v0`…`v9` or e.g. `320k`), `flac` (`0`…`12`), `m4a` (AAC, e.g. `256k`),
+`alac`, `wav`.
+
+```bash
+./target/release/dj-music-suite transcode --to mp3 --input <DIR> --output <DIR>          # analyze, writes transcode-plan.json
+./target/release/dj-music-suite transcode --to mp3 --input <DIR> --output <DIR> --execute
+./target/release/dj-music-suite transcode --to flac --input <DIR> --replace --execute    # convert in place, sources to the trash
+./target/release/dj-music-suite transcode --to mp3 --execute --from transcode-plan.json  # apply a plan
+```
+
+| Option | Description |
+| --- | --- |
+| `--to <FMT>` | target format: `mp3` `flac` `m4a` `alac` `wav` (required) |
+| `--input <DIR>` | folder to scan recursively (default: the configured library root) |
+| `--output <DIR>` | folder to write into (default: next to each source). The tree below `--input` is preserved, so same-named files in different folders never collide |
+| `--quality <Q>` | encoder setting: mp3 `v0`..`v9` or `320k` (default `v0`), m4a bitrate (default `256k`), flac `0`..`12` (default `8`); alac and wav take none, and passing one is an error rather than being ignored |
+| `--replace` | move each source into the trash folder after it converted (default `<input>/.dedup-trash`). Only valid without `--output` |
+| `--threads <N>` | parallel conversions (default: 8) |
+| `--ffmpeg <FILE>` | ffmpeg binary to use (default: `ffmpeg` from `$PATH`) |
+| `--trash <DIR>` | trash folder for `--replace` (default: `<input>/.dedup-trash`) |
+| `--execute` | actually convert (default: analyze only and write the plan) |
+| `--from <FILE>` | execute a previously generated plan json instead of re-analyzing |
+| `--plan <FILE>` | plan json path (default `transcode-plan.json`) |
+
+The analysis classifies every file: `ready`, `same-codec` (already the target
+codec, per the source's *actual* container — an ALAC `.m4a` counts as a real
+conversion to AAC `.m4a` even though the extension matches), `conflict`
+(target exists) and `needs-replace` (the output would overwrite its own
+source, e.g. `alac→aac` in place without `--replace`). Only `ready` entries
+convert, and `same-codec` files are skipped on purpose: re-encoding a file
+that already is the target only loses quality.
+
+What carries over is ffmpeg's metadata mapping (`-map_metadata 0`) plus the
+attached cover (`-map 0:v?`, valid in mp3/flac/m4a, dropped for `wav` — which
+the report says out loud). Lyrics are re-written afterwards in the key each
+container defines (ID3v2 `USLT`, Vorbis `LYRICS`, MP4 `©lyr`), because
+ffmpeg's own mapping puts them where DJ software does not look.
+
+Two things worth knowing before a run:
+
+- lossy → lossless (`mp3` → `flac`) is flagged as *no quality gain*, not
+  blocked: the report says the file only gets bigger.
+- a file the analysis could not probe (ape, wma, dsd, …) is still converted;
+  the note says its tags could not be read, so the output may be untagged.
+
+Converted files have to be re-read by rekordbox: refresh the library root.
+Replacing a source in place keeps its path, so no relink is needed there.
+
 ## reorg
 
 Moves the files of a music library folder into a tag-based layout. It only
@@ -129,7 +188,8 @@ left untouched: it might be the only surviving copy of the song.
 
 ### trash
 
-Every file dedup moves out gets a record of where it came from, appended to
+Every file dedup moves out — and every source `transcode --replace` retires —
+gets a record of where it came from, appended to
 `<root>/.dedup-trash/manifest.json` (by the CLI and the web UI alike). Without
 it a trashed `track01.flac` is just a name — and its `track01-1.flac` sibling
 is a guess — so restoring would be guesswork.
@@ -169,10 +229,10 @@ running `dj-music-suite-web` for UI iteration.
 ## web ui
 
 A local web UI covering the flows non-CLI users need: converting `.ncm`
-files, importing music into the library, reorganizing it and removing
-duplicates. Everything stays on the machine — the server listens on
-`127.0.0.1` only, and files are uploaded into a local staging folder (never
-sent anywhere).
+files, importing music into the library, reorganizing it, removing
+duplicates and transcoding formats. Everything stays on the machine — the
+server listens on `127.0.0.1` only, and files are uploaded into a local
+staging folder (never sent anywhere).
 
 ```bash
 ./target/release/dj-music-suite-web [--port 8765] [--no-open]
@@ -188,8 +248,9 @@ explicit confirmation (the same analyze → execute two-phase design as the
 CLI). Progress streams live into the page. `--no-open` skips launching the
 browser automatically.
 
-The 整理 (reorg) and 去重 (dedup) tabs run the CLI's other two commands on the
-configured library root, with the same analyze → review → execute split:
+The 整理 (reorg), 去重 (dedup) and 转码 (transcode) tabs run the CLI's other
+commands on the configured library root, with the same analyze → review →
+execute split:
 
 - **整理** analyzes the root against a directory template and lists every file
   as move / rename / move+rename / in place / conflict / untagged, plus the
@@ -204,10 +265,22 @@ configured library root, with the same analyze → review → execute split:
   Removals only ever move losers into `<root>/.dedup-trash/<kind>/`; the web
   UI never deletes outright (`--delete` stays a CLI-only, irreversible
   option). Groups whose keeper is gone are left untouched, as in the CLI.
+- **转码** drives the same ffmpeg-backed conversion as the CLI: pick a target
+  (mp3 / flac / m4a-AAC / m4a-ALAC / wav) and quality, and choose between
+  converting in place and writing into a subfolder of the library root (the
+  web UI only ever writes inside the library it manages, so a path outside it
+  is rejected). The tab probes ffmpeg once on load and greys out any target
+  the local build cannot encode, with the install hint shown when ffmpeg is
+  missing entirely. The preview table shows each file's source codec, status
+  and notes (lossy → lossless, dropped wav cover, unreadable tags), with only
+  `ready` rows ticked; the per-file encoder position streams into the progress
+  bar while a conversion runs. Executing with replace on leaves each source in
+  `<root>/.dedup-trash/transcoded/`, so it appears in the 去重 tab's trash
+  list and can be restored like any dedup loser.
 
-Both keep the analyzed plan in server memory (the hash/score cache is reused
-when re-scanning), so a page reload restores the plan and any running job's
-progress, while restarting the server means analyzing again.
+All three keep the analyzed plan in server memory (the hash/score cache is
+reused when re-scanning), so a page reload restores the plan and any running
+job's progress, while restarting the server means analyzing again.
 
 ### dedup trash
 
@@ -223,6 +296,11 @@ listed as unknown origin — deletable, not restorable.
 Workspace layout: `crates/core` (UI-agnostic logic, event sink + structured
 results), `crates/cli` (argument parsing + terminal rendering),
 `crates/server` (axum web UI calling into core).
+
+Dependencies: everything is Rust, except `transcode`, which shells out to
+**ffmpeg** (found on `$PATH`, or given explicitly). No other command needs an
+external binary — `.ncm` decryption is built in via `ncm-core` — and nothing
+is downloaded at build time.
 
 ## Acknowledgements
 

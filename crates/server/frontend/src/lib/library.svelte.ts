@@ -5,8 +5,10 @@
 import {
   deleteTrash,
   getDedupPlan,
+  getFfmpeg,
   getJob,
   getReorgPlan,
+  getTranscodePlan,
   getTrash,
   reorgDefaultIncluded,
   restoreTrash,
@@ -14,11 +16,17 @@ import {
   startDedupExecute,
   startReorgAnalyze,
   startReorgExecute,
+  startTranscodeAnalyze,
+  startTranscodeExecute,
   type DedupPlan,
   type DedupResult,
+  type FfmpegStatus,
   type JobSnapshot,
   type ReorgPlan,
   type ReorgResult,
+  type TranscodePlan,
+  type TranscodeResult,
+  type TranscodeTarget,
   type TrashEntry,
   type TrashListing,
   type TrashResult,
@@ -66,6 +74,54 @@ export const dedup = $state<{
   result: null,
   executeError: "",
 });
+
+export const transcode = $state<{
+  to: TranscodeTarget;
+  quality: string;
+  /** "" = next to each source; otherwise a subfolder of the library root */
+  output: string;
+  replace: boolean;
+  ffmpeg: FfmpegStatus | null;
+  plan: TranscodePlan | null;
+  /** src -> ticked in the preview table */
+  included: Record<string, boolean>;
+  error: string;
+  waiting: boolean;
+  executing: boolean;
+  result: TranscodeResult | null;
+  executeError: string;
+}>({
+  to: "mp3",
+  quality: "",
+  output: "",
+  replace: false,
+  ffmpeg: null,
+  plan: null,
+  included: {},
+  error: "",
+  waiting: false,
+  executing: false,
+  result: null,
+  executeError: "",
+});
+
+/// Whether the local ffmpeg can encode this target; null = not probed yet.
+export function ffmpegSupports(target: TranscodeTarget): boolean | null {
+  if (!transcode.ffmpeg) return null;
+  if (!transcode.ffmpeg.available) return false;
+  return transcode.ffmpeg.targets?.find((t) => t.target === target)?.ok ?? false;
+}
+
+export async function checkFfmpeg() {
+  try {
+    transcode.ffmpeg = await getFfmpeg();
+  } catch (e) {
+    transcode.ffmpeg = {
+      available: false,
+      error: e instanceof Error ? e.message : String(e),
+    };
+  }
+}
 
 export const trash = $state<{
   listing: TrashListing | null;
@@ -301,6 +357,86 @@ export async function doDedupExecute() {
   }
 }
 
+export async function doTranscodeAnalyze() {
+  transcode.error = "";
+  transcode.waiting = true;
+  transcode.result = null;
+  transcode.executeError = "";
+  try {
+    await startTranscodeAnalyze({
+      to: transcode.to,
+      quality: transcode.quality.trim(),
+      output: transcode.output.trim(),
+      replace: transcode.replace,
+    });
+    const end = await watchJob("transcode-analyze");
+    if (end.type === "done") applyTranscodePlan(end.result as TranscodePlan);
+    else transcode.error = end.type === "error" ? end.message : "没有收到转码分析任务";
+  } catch (e) {
+    transcode.error = e instanceof Error ? e.message : String(e);
+  } finally {
+    transcode.waiting = false;
+  }
+}
+
+function applyTranscodePlan(plan: TranscodePlan) {
+  transcode.plan = plan;
+  // tick exactly the rows the CLI would convert; the rest stays an explicit
+  // per-row opt-in
+  transcode.included = {};
+  for (const entry of plan.entries) {
+    transcode.included[entry.src] = entry.status === "ready";
+  }
+}
+
+export async function doTranscodeExecute() {
+  if (!transcode.plan) return;
+  transcode.executing = true;
+  transcode.executeError = "";
+  transcode.result = null;
+  try {
+    const include = transcode.plan.entries
+      .filter((e) => transcode.included[e.src] ?? e.status === "ready")
+      .map((e) => e.src);
+    if (!include.length) {
+      transcode.executeError = "没有勾选任何条目";
+      return;
+    }
+    await startTranscodeExecute(include);
+    const end = await watchJob("transcode-execute");
+    if (end.type === "done") {
+      transcode.result = end.result as TranscodeResult;
+      // the plan described the library as it was, and --replace may have
+      // moved sources into the trash: both make the table stale
+      transcode.plan = null;
+      transcode.included = {};
+      refreshTrash();
+    } else {
+      transcode.executeError = end.type === "error" ? end.message : "没有收到转码任务";
+    }
+  } catch (e) {
+    transcode.executeError = e instanceof Error ? e.message : String(e);
+  } finally {
+    transcode.executing = false;
+  }
+}
+
+function applyTranscodeFinish(
+  kind: JobSnapshot["kind"],
+  end: { type: string; result?: unknown; message?: string },
+) {
+  if (end.type === "error") {
+    transcode.error = end.message ?? "任务失败";
+    return;
+  }
+  if (end.type !== "done") return;
+  if (kind === "transcode-analyze") applyTranscodePlan(end.result as TranscodePlan);
+  else {
+    transcode.result = end.result as TranscodeResult;
+    refreshTrash();
+  }
+}
+
 /// Restore the reorg/dedup tab after a page reload (see [`restoreLibrary`]).
 /// The result payloads differ per kind — an analyze yields a plan, an execute
 /// yields a summary — so each kind routes to its own slot; feeding a summary
@@ -335,7 +471,7 @@ function applyDedupFinish(kind: JobSnapshot["kind"], end: { type: string; result
 ///
 /// A running job is resumed in the background: awaiting it here would keep
 /// the user on the default tab, without progress, until the job finished.
-export async function restoreLibrary(): Promise<"reorg" | "dedup" | null> {
+export async function restoreLibrary(): Promise<"reorg" | "dedup" | "transcode" | null> {
   let snapshot: JobSnapshot | { status: "idle" };
   try {
     snapshot = await getJob();
@@ -376,6 +512,26 @@ export async function restoreLibrary(): Promise<"reorg" | "dedup" | null> {
     }
     return "dedup";
   }
+  if (
+    "kind" in snapshot &&
+    (snapshot.kind === "transcode-analyze" || snapshot.kind === "transcode-execute")
+  ) {
+    const kind = snapshot.kind;
+    if (snapshot.status === "running") {
+      transcode.waiting = kind === "transcode-analyze";
+      transcode.executing = !transcode.waiting;
+      resumeRunningJob(snapshot).then((end) => {
+        transcode.waiting = false;
+        transcode.executing = false;
+        applyTranscodeFinish(kind, end);
+      });
+    } else if (snapshot.status === "done") {
+      applyTranscodeFinish(kind, { type: "done", result: snapshot.result });
+    } else {
+      transcode.error = snapshot.error ?? "任务失败";
+    }
+    return "transcode";
+  }
   if ("kind" in snapshot && (snapshot.kind === "trash-restore" || snapshot.kind === "trash-delete")) {
     const restoring = snapshot.kind === "trash-restore";
     const finish = (end: { type: string; result?: unknown; message?: string }) => {
@@ -404,7 +560,11 @@ export async function restoreLibrary(): Promise<"reorg" | "dedup" | null> {
   // whatever is sitting in the trash folder
   refreshTrash();
   try {
-    const [r, d] = await Promise.all([getReorgPlan(), getDedupPlan()]);
+    const [r, d, t] = await Promise.all([
+      getReorgPlan(),
+      getDedupPlan(),
+      getTranscodePlan(),
+    ]);
     if (r.plan) {
       applyReorgPlan(r.plan);
       return "reorg";
@@ -412,6 +572,10 @@ export async function restoreLibrary(): Promise<"reorg" | "dedup" | null> {
     if (d.plan) {
       applyDedupPlan(d.plan);
       return "dedup";
+    }
+    if (t.plan) {
+      applyTranscodePlan(t.plan);
+      return "transcode";
     }
   } catch {
     // nothing to restore

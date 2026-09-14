@@ -14,6 +14,7 @@ use dj_music_core::convert::{self, ConvertOpts};
 use dj_music_core::dedup as core_dedup;
 use dj_music_core::import::{self as core_import, Mode};
 use dj_music_core::reorg as core_reorg;
+use dj_music_core::transcode as core_transcode;
 use dj_music_core::trash as core_trash;
 
 use crate::state::{start_job, JobKind, JobStatus, AppState};
@@ -42,6 +43,10 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/dedup/analyze", post(dedup_analyze))
         .route("/api/dedup/execute", post(dedup_execute))
         .route("/api/dedup/plan", get(dedup_plan))
+        .route("/api/transcode/analyze", post(transcode_analyze))
+        .route("/api/transcode/execute", post(transcode_execute))
+        .route("/api/transcode/plan", get(transcode_plan))
+        .route("/api/transcode/ffmpeg", get(transcode_ffmpeg))
         .route("/api/trash", get(trash_list))
         .route("/api/trash/restore", post(trash_restore))
         .route("/api/trash/delete", post(trash_delete))
@@ -557,6 +562,214 @@ fn dedup_plan_json(plan: &core_dedup::Plan, stats: core_dedup::DedupStats) -> se
         "groups": plan.groups,
         "stats": { "scanned": stats.scanned, "unreadable": stats.unreadable },
     })
+}
+
+// ---------- transcode ----------
+//
+// The one command that rewrites audio instead of moving it, so it is the one
+// that needs an external encoder: ffmpeg is located once per request and the
+// target's encoder is checked before a plan exists. Like reorg/dedup, execute
+// only ever refers to the plan held in memory.
+
+/// A transcode plan is just entries + settings; it goes out as-is.
+fn transcode_plan_json(plan: &core_transcode::Plan) -> serde_json::Value {
+    json!({
+        "input": plan.input,
+        "output": plan.output,
+        "target": plan.target,
+        "quality": plan.quality,
+        "replace": plan.replace,
+        "trash": plan.trash,
+        "entries": plan.entries,
+    })
+}
+
+fn transcode_target_or_error(raw: Option<&str>) -> Result<core_transcode::TargetFormat, Response> {
+    let raw = raw.unwrap_or_default();
+    core_transcode::TargetFormat::parse(raw)
+        .ok_or_else(|| bad_request(format!("不支持的目标格式: {raw}（可选 mp3 / flac / m4a / alac / wav）")))
+}
+
+/// Where the converted files go. Absent/empty means "next to each source";
+/// otherwise a folder *inside* the library root, never an arbitrary path: the
+/// web surface only ever writes inside the library it manages.
+fn transcode_output_or_error(root: &Path, raw: Option<&str>) -> Result<Option<PathBuf>, Response> {
+    let raw = raw.map(str::trim).unwrap_or_default();
+    if raw.is_empty() {
+        return Ok(None);
+    }
+    let rel = Path::new(raw);
+    let escapes = rel.is_absolute()
+        || rel
+            .components()
+            .any(|c| !matches!(c, std::path::Component::Normal(_)));
+    if escapes {
+        return Err(bad_request("输出目录必须是曲库内的相对子目录"));
+    }
+    Ok(Some(root.join(rel)))
+}
+
+/// The ffmpeg this server would use: `ffmpeg` on $PATH. Reported up front so
+/// the tab can disable targets this build cannot encode instead of failing a
+/// run halfway.
+async fn transcode_ffmpeg() -> Response {
+    match core_transcode::Ffmpeg::detect(None) {
+        Ok(ff) => {
+            let targets: Vec<serde_json::Value> = core_transcode::TargetFormat::all()
+                .iter()
+                .map(|target| {
+                    let missing: Vec<&str> = target
+                        .encoders()
+                        .iter()
+                        .copied()
+                        .filter(|e| !ff.has_encoder(e))
+                        .collect();
+                    json!({
+                        "target": target,
+                        "label": target.label(),
+                        "ok": missing.is_empty(),
+                        "missing": missing,
+                    })
+                })
+                .collect();
+            Json(json!({
+                "available": true,
+                "version": ff.version,
+                "path": ff.path,
+                "targets": targets,
+            }))
+            .into_response()
+        }
+        Err(e) => Json(json!({
+            "available": false,
+            "error": e.to_string(),
+        }))
+        .into_response(),
+    }
+}
+
+async fn transcode_analyze(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<serde_json::Value>,
+) -> Response {
+    let root = match library_root_or_error(&state) {
+        Ok(root) => root,
+        Err(resp) => return resp,
+    };
+    let target = match transcode_target_or_error(body.get("to").and_then(|v| v.as_str())) {
+        Ok(target) => target,
+        Err(resp) => return resp,
+    };
+    let output = match transcode_output_or_error(&root, body.get("output").and_then(|v| v.as_str()))
+    {
+        Ok(output) => output,
+        Err(resp) => return resp,
+    };
+    let quality = body
+        .get("quality")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|q| !q.is_empty())
+        .map(str::to_string);
+    let replace = body
+        .get("replace")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    let state2 = Arc::clone(&state);
+    let result = start_job(
+        &state,
+        JobKind::TranscodeAnalyze,
+        None,
+        move |sink: dj_music_core::Sink| {
+            let opts = core_transcode::TranscodeOpts {
+                input: root,
+                output,
+                target,
+                quality,
+                replace,
+                threads: core_transcode::DEFAULT_THREADS,
+                // no --ffmpeg override in the web UI: it uses $PATH
+                ffmpeg: None,
+                trash: None,
+                // no plan file for the web UI: the plan stays in memory
+                plan: None,
+                from: None,
+            };
+            let plan = core_transcode::analyze(&opts, sink).map_err(|e| e.to_string())?;
+            let value = transcode_plan_json(&plan);
+            state2.library.lock().transcode = Some(plan);
+            Ok(value)
+        },
+    );
+    match result {
+        Ok(()) => Json(json!({"started": true})).into_response(),
+        Err(e) => conflict(e),
+    }
+}
+
+async fn transcode_execute(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<serde_json::Value>,
+) -> Response {
+    let Some(items) = body.get("include").and_then(|v| v.as_array()) else {
+        return bad_request("缺少 include（要转换的条目列表）");
+    };
+    let include: BTreeSet<PathBuf> = items
+        .iter()
+        .filter_map(|v| v.as_str())
+        .map(PathBuf::from)
+        .collect();
+    let held = state.library.lock().transcode.clone();
+    let Some(plan) = held else {
+        return bad_request("请先运行转码分析");
+    };
+
+    let state2 = Arc::clone(&state);
+    let result = start_job(
+        &state,
+        JobKind::TranscodeExecute,
+        None,
+        move |sink: dj_music_core::Sink| {
+            // convert exactly the ticked rows
+            let mut plan = plan;
+            plan.entries.retain(|e| include.contains(&e.src));
+            let trash = plan.trash.clone();
+            let summary = core_transcode::execute_plan(
+                &plan,
+                core_transcode::DEFAULT_THREADS,
+                None,
+                sink,
+            )
+            .map_err(|e| e.to_string())?;
+            // the plan described the library as it was: drop it so a reload
+            // can't restore a table of conversions that already happened
+            state2.library.lock().transcode = None;
+            Ok(json!({
+                "converted": summary.converted,
+                "skipped": summary.skipped,
+                "failed": summary.failed,
+                "trashed": summary.trashed,
+                "bytes_before": summary.bytes_before,
+                "bytes_after": summary.bytes_after,
+                "trash": trash,
+            }))
+        },
+    );
+    match result {
+        Ok(()) => Json(json!({"started": true})).into_response(),
+        Err(e) => conflict(e),
+    }
+}
+
+async fn transcode_plan(State(state): State<Arc<AppState>>) -> Response {
+    let plan = state
+        .library
+        .lock()
+        .transcode
+        .as_ref()
+        .map(transcode_plan_json);
+    Json(json!({ "plan": plan })).into_response()
 }
 
 async fn reorg_analyze(

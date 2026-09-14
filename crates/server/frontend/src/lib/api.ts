@@ -44,6 +44,7 @@ export interface ExecuteResult {
 export type JobEvent =
   | { type: "start"; total: number }
   | { type: "step"; name: string }
+  | { type: "tick"; percent: number }
   | { type: "line"; text: string }
   | { type: "warn"; text: string };
 
@@ -69,6 +70,8 @@ export type JobKind =
   | "reorg-execute"
   | "dedup-analyze"
   | "dedup-execute"
+  | "transcode-analyze"
+  | "transcode-execute"
   | "trash-restore"
   | "trash-delete";
 
@@ -326,6 +329,87 @@ export const startDedupExecute = (keepers: Record<number, string>) =>
 export const getDedupPlan = () =>
   call<{ plan: DedupPlan | null }>("/api/dedup/plan");
 
+// ---------- transcode ----------
+
+export type TranscodeTarget = "mp3" | "flac" | "m4a" | "alac" | "wav";
+
+/** "ready", "same-codec", "conflict" or "needs-replace" */
+export type TranscodeStatus = "ready" | "same-codec" | "conflict" | "needs-replace";
+
+export interface TranscodeEntry {
+  src: string;
+  dst?: string;
+  /** "transcode", or "replace" when the destination is the source itself */
+  op: string;
+  status: TranscodeStatus;
+  src_codec?: string;
+  src_bit_depth?: number;
+  duration_secs?: number;
+  size: number;
+  note?: string;
+}
+
+export interface TranscodePlan {
+  input: string;
+  output?: string;
+  target: TranscodeTarget;
+  quality?: string;
+  replace: boolean;
+  trash: string;
+  entries: TranscodeEntry[];
+}
+
+export interface TranscodeResult {
+  converted: number;
+  skipped: number;
+  failed: number;
+  trashed: number;
+  bytes_before: number;
+  bytes_after: number;
+  trash: string;
+}
+
+export interface FfmpegTarget {
+  target: TranscodeTarget;
+  label: string;
+  ok: boolean;
+  missing: string[];
+}
+
+export interface FfmpegStatus {
+  available: boolean;
+  version?: string;
+  path?: string;
+  error?: string;
+  targets?: FfmpegTarget[];
+}
+
+export const startTranscodeAnalyze = (opts: {
+  to: TranscodeTarget;
+  quality: string;
+  /** a folder inside the library root, or "" for "next to each source" */
+  output: string;
+  replace: boolean;
+}) =>
+  call<{ started: boolean }>("/api/transcode/analyze", {
+    method: "POST",
+    headers: jsonHeaders,
+    body: JSON.stringify(opts),
+  });
+
+/** `include` = the src paths ticked in the preview table. */
+export const startTranscodeExecute = (include: string[]) =>
+  call<{ started: boolean }>("/api/transcode/execute", {
+    method: "POST",
+    headers: jsonHeaders,
+    body: JSON.stringify({ include }),
+  });
+
+export const getTranscodePlan = () =>
+  call<{ plan: TranscodePlan | null }>("/api/transcode/plan");
+
+export const getFfmpeg = () => call<FfmpegStatus>("/api/transcode/ffmpeg");
+
 // ---------- trash ----------
 
 export const getTrash = () => call<TrashListing>("/api/trash");
@@ -376,6 +460,30 @@ export const REORG_OP_LABELS: Record<ReorgOp, string> = {
 export const DEDUP_KIND_LABELS: Record<DedupGroup["kind"], string> = {
   identical: "内容相同",
   "same-identity": "同曲异版",
+};
+
+export const TRANSCODE_TARGET_LABELS: Record<TranscodeTarget, string> = {
+  mp3: "mp3（有损，兼容性最好）",
+  flac: "flac（无损，体积大）",
+  m4a: "m4a / AAC（有损）",
+  alac: "m4a / ALAC（无损）",
+  wav: "wav（无损，无封面）",
+};
+
+/// Encoder quality each target defaults to, mirroring core's defaults.
+export const TRANSCODE_QUALITY_HINT: Record<TranscodeTarget, string> = {
+  mp3: "v0（默认）或 320k",
+  flac: "0-12，默认 8",
+  m4a: "256k（默认）",
+  alac: "无此参数",
+  wav: "无此参数",
+};
+
+export const TRANSCODE_STATUS_LABELS: Record<TranscodeStatus, string> = {
+  "ready": "待转换",
+  "same-codec": "已是目标格式",
+  "conflict": "目标已存在",
+  "needs-replace": "需要「转完后移入回收站」",
 };
 
 /// Rows the reorg table ticks by default: only what can actually move, and

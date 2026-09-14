@@ -1,4 +1,5 @@
-//! Core logic of the dj-music-suite: convert, import, reorg and dedup.
+//! Core logic of the dj-music-suite: convert, import, reorg, dedup and
+//! transcode.
 //!
 //! The crate is UI-agnostic: operations report progress through an [`Event`]
 //! sink instead of printing, and return structured results instead of exit
@@ -14,6 +15,7 @@ pub mod reorg;
 pub mod scan;
 pub mod tags;
 pub mod template;
+pub mod transcode;
 pub mod trash;
 
 /// Errors that map onto distinct CLI exit codes: usage problems exit 2,
@@ -36,6 +38,9 @@ pub enum Event {
     Start(u64),
     /// one item of the current phase finished; the string names it
     Step(String),
+    /// progress *within* the current item, 0..=100 (transcode: the encoder's
+    /// position in the file); started over by the next [`Event::Step`]
+    Tick(u8),
     /// an informational output line (terminal: stdout)
     Line(String),
     /// a warning (terminal: stderr)

@@ -8,6 +8,7 @@ use dj_music_core::config::{self, Config, Paths};
 use dj_music_core::dedup as core_dedup;
 use dj_music_core::import::ImportPlan;
 use dj_music_core::reorg as core_reorg;
+use dj_music_core::transcode as core_transcode;
 
 /// One job at a time (the core operations take over whole staging dirs and
 /// the library index; parallel jobs would just fight each other).
@@ -20,6 +21,8 @@ pub enum JobKind {
     ReorgExecute,
     DedupAnalyze,
     DedupExecute,
+    TranscodeAnalyze,
+    TranscodeExecute,
     TrashRestore,
     TrashDelete,
 }
@@ -34,6 +37,8 @@ impl JobKind {
             JobKind::ReorgExecute => "reorg-execute",
             JobKind::DedupAnalyze => "dedup-analyze",
             JobKind::DedupExecute => "dedup-execute",
+            JobKind::TranscodeAnalyze => "transcode-analyze",
+            JobKind::TranscodeExecute => "transcode-execute",
             JobKind::TrashRestore => "trash-restore",
             JobKind::TrashDelete => "trash-delete",
         }
@@ -92,6 +97,8 @@ pub struct LibraryPlans {
     pub reorg: Option<core_reorg::Plan>,
     pub dedup: Option<(core_dedup::Plan, core_dedup::DedupStats)>,
     pub dedup_cache: std::collections::BTreeMap<String, core_dedup::CachedFile>,
+    /// analyzed transcode plan (the web UI uses `ffmpeg` from $PATH)
+    pub transcode: Option<core_transcode::Plan>,
 }
 
 pub struct AppState {
@@ -205,6 +212,7 @@ pub fn event_json(event: &dj_music_core::Event) -> serde_json::Value {
     match event {
         Event::Start(total) => serde_json::json!({"type": "start", "total": total}),
         Event::Step(name) => serde_json::json!({"type": "step", "name": name}),
+        Event::Tick(pct) => serde_json::json!({"type": "tick", "percent": pct}),
         Event::Line(text) => serde_json::json!({"type": "line", "text": text}),
         Event::Warn(text) => serde_json::json!({"type": "warn", "text": text}),
     }

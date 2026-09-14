@@ -126,6 +126,34 @@ fn safe_rel(rel: &str) -> Option<PathBuf> {
     (!out.as_os_str().is_empty()).then_some(out)
 }
 
+/// Move `src` into `<trash>/<kind>/`, keeping the original file name and
+/// uniquifying on collision. Falls back to copy+remove across filesystems.
+/// The dedup and transcode commands share it so a file trashed by either is
+/// restorable the same way.
+pub fn move_into(src: &Path, trash: &Path, kind: &str) -> std::io::Result<PathBuf> {
+    let dir = trash.join(kind);
+    fs::create_dir_all(&dir)?;
+    let name = src
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("file")
+        .to_string();
+    let ext = src
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| format!(".{e}"))
+        .unwrap_or_default();
+    let stem = name.strip_suffix(&ext).unwrap_or(&name);
+    let mut dst = dir.join(&name);
+    let mut n = 1u32;
+    while dst.exists() {
+        dst = dir.join(format!("{stem}-{n}{ext}"));
+        n += 1;
+    }
+    move_file(src, &dst)?;
+    Ok(dst)
+}
+
 fn resolve_original(root: &Path, stored: &str) -> PathBuf {
     let path = Path::new(stored);
     if path.is_absolute() {

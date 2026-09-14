@@ -9,6 +9,7 @@ use indicatif::{ProgressBar, ProgressStyle};
 
 use dj_music_core::convert::ConvertOpts;
 use dj_music_core::import::{self as core_import, Mode as CoreMode};
+use dj_music_core::transcode as core_transcode;
 use dj_music_core::{dedup as core_dedup, reorg as core_reorg, trash as core_trash, Event};
 
 #[derive(Parser)]
@@ -16,7 +17,7 @@ use dj_music_core::{dedup as core_dedup, reorg as core_reorg, trash as core_tras
     name = "dj-music-suite",
     version,
     about = "a suite of small tools for music files",
-    long_about = "dj-music-suite - a suite of small tools for music files\n\nDecryption is built in (ncm_core), no external binaries are needed.\nConverted files are tagged automatically when possible: title, artist and\nalbum come from the .ncm metadata; the cover comes from\n<meta-dir>/track-<musicId>.jpg, then the image embedded in the .ncm file, then\nthe albumPic URL (unless --no-download; downloads are cached into <meta-dir>);\na same-named .lrc file is embedded as unsynced lyrics (USLT).\n\n`import` copies (or moves) new audio files into the music library folder,\ndeduplicating against what is already there: same artist + title and a\nsimilar duration is skipped as a duplicate, a different duration is imported\nas an alternate version.\n\n`reorg` moves the files of a music library folder into a tag-based layout.\nIt only touches the filesystem: analyze first, then let rekordbox relink the\nmoved files via File -> Display All Missing Files -> Relocate."
+    long_about = "dj-music-suite - a suite of small tools for music files\n\nDecryption is built in (ncm_core), no external binaries are needed.\nConverted files are tagged automatically when possible: title, artist and\nalbum come from the .ncm metadata; the cover comes from\n<meta-dir>/track-<musicId>.jpg, then the image embedded in the .ncm file, then\nthe albumPic URL (unless --no-download; downloads are cached into <meta-dir>);\na same-named .lrc file is embedded as unsynced lyrics (USLT).\n\n`import` copies (or moves) new audio files into the music library folder,\ndeduplicating against what is already there: same artist + title and a\nsimilar duration is skipped as a duplicate, a different duration is imported\nas an alternate version.\n\n`reorg` moves the files of a music library folder into a tag-based layout.\nIt only touches the filesystem: analyze first, then let rekordbox relink the\nmoved files via File -> Display All Missing Files -> Relocate.\n\n`transcode` re-encodes audio files into another format and is the only\ncommand that needs an external binary: ffmpeg is looked up on $PATH (or\npassed as --ffmpeg) and the target encoder is checked before anything runs.\nTags, cover art and lyrics are carried over; files that already are the\ntarget codec are skipped rather than re-encoded, and a source that would be\noverwritten by its own conversion is refused unless --replace moves it into\nthe trash folder first."
 )]
 struct Cli {
     #[command(subcommand)]
@@ -27,6 +28,8 @@ struct Cli {
 enum Commands {
     /// batch convert .ncm files and embed cover art + lyrics
     Convert(ConvertArgs),
+    /// transcode audio files into another format with ffmpeg
+    Transcode(TranscodeArgs),
     /// copy new audio files into the music library with duplicate detection
     Import(ImportArgs),
     /// reorganize a music library folder on disk (analyze by default)
@@ -69,6 +72,78 @@ impl From<ConvertArgs> for ConvertOpts {
             threads: a.threads,
             meta_dir: a.meta_dir,
             no_download: a.no_download,
+        }
+    }
+}
+
+#[derive(clap::Args)]
+struct TranscodeArgs {
+    /// target format
+    #[arg(long, value_enum)]
+    to: TargetArg,
+
+    /// folder with the audio files to convert (scanned recursively,
+    /// default: the library root configured in the web UI)
+    #[arg(long, value_name = "DIR")]
+    input: Option<PathBuf>,
+
+    /// folder to write into (default: next to each source; the tree below
+    /// --input is preserved, so same-named files never collide)
+    #[arg(long, value_name = "DIR")]
+    output: Option<PathBuf>,
+
+    /// encoder quality: mp3 v0..v9 or e.g. 320k (default v0), m4a e.g. 256k
+    /// (default), flac 0..12 (default 8); alac and wav take no quality
+    #[arg(long, value_name = "Q")]
+    quality: Option<String>,
+
+    /// move each source into the trash folder after it converted (the only
+    /// way a conversion that would overwrite its source is allowed)
+    #[arg(long)]
+    replace: bool,
+
+    /// number of parallel conversions
+    #[arg(long, value_name = "N", default_value_t = dj_music_core::transcode::DEFAULT_THREADS)]
+    threads: usize,
+
+    /// ffmpeg binary to use (default: `ffmpeg` from $PATH)
+    #[arg(long, value_name = "FILE")]
+    ffmpeg: Option<PathBuf>,
+
+    /// trash folder for --replace (default: <input>/.dedup-trash)
+    #[arg(long, value_name = "DIR")]
+    trash: Option<PathBuf>,
+
+    /// actually convert the files (default: analyze only and write the plan)
+    #[arg(long)]
+    execute: bool,
+
+    /// execute a previously generated plan json instead of analyzing again
+    #[arg(long, value_name = "FILE")]
+    from: Option<PathBuf>,
+
+    /// plan json written by the analysis (and read back with --from)
+    #[arg(long, value_name = "FILE", default_value = "transcode-plan.json")]
+    plan: PathBuf,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum TargetArg {
+    Mp3,
+    Flac,
+    M4a,
+    Alac,
+    Wav,
+}
+
+impl From<TargetArg> for core_transcode::TargetFormat {
+    fn from(t: TargetArg) -> Self {
+        match t {
+            TargetArg::Mp3 => core_transcode::TargetFormat::Mp3,
+            TargetArg::Flac => core_transcode::TargetFormat::Flac,
+            TargetArg::M4a => core_transcode::TargetFormat::M4a,
+            TargetArg::Alac => core_transcode::TargetFormat::Alac,
+            TargetArg::Wav => core_transcode::TargetFormat::Wav,
         }
     }
 }
@@ -260,6 +335,13 @@ impl TerminalSink {
                 }
             }
             Event::Warn(text) => eprintln!("{text}"),
+            // per-file progress: the bar is per file, so show the encoder's
+            // position in the current one next to it
+            Event::Tick(pct) => {
+                if let Some(pb) = self.bar.lock().unwrap().as_ref() {
+                    pb.set_message(format!("{} ({pct}%)", pb.message()));
+                }
+            }
         }
     }
 
@@ -294,6 +376,7 @@ fn main() {
     };
     let code = match cli.command {
         Some(Commands::Convert(args)) => cmd_convert(args, &sink),
+        Some(Commands::Transcode(args)) => cmd_transcode(args, &sink),
         Some(Commands::Import(args)) => cmd_import(args, &sink),
         Some(Commands::Reorg(args)) => cmd_reorg(args, &sink),
         Some(Commands::Dedup(args)) => cmd_dedup(args, &sink),
@@ -328,6 +411,138 @@ fn cmd_convert(args: ConvertArgs, sink: &TerminalSink) -> i32 {
         summary.tagged, summary.failed
     );
     i32::from(summary.failed > 0)
+}
+
+fn cmd_transcode(args: TranscodeArgs, sink: &TerminalSink) -> i32 {
+    if args.replace && args.output.is_some() {
+        eprintln!("--replace only makes sense without --output (it moves the sources that were converted)");
+        return 2;
+    }
+    if args.from.is_some() && !args.execute {
+        eprintln!("--from only makes sense together with --execute");
+        return 2;
+    }
+    let input = match args.input.clone() {
+        Some(input) => input,
+        // default: the library root, resolved exactly like reorg/dedup do
+        None => match dj_music_core::config::resolve_library_root(None) {
+            Ok(root) => root,
+            Err(e) => return error_code(e),
+        },
+    };
+    let opts = core_transcode::TranscodeOpts {
+        input: input.clone(),
+        output: args.output,
+        target: args.to.into(),
+        quality: args.quality,
+        replace: args.replace,
+        threads: args.threads,
+        ffmpeg: args.ffmpeg,
+        trash: args.trash,
+        plan: Some(args.plan.clone()),
+        from: args.from.clone(),
+    };
+    let sink_fn = |e: &Event| sink.sink(e);
+    if !args.execute {
+        match core_transcode::analyze(&opts, &sink_fn) {
+            Ok(plan) => {
+                sink.finish();
+                print_transcode_report(&plan);
+                0
+            }
+            Err(e) => error_code(e),
+        }
+    } else {
+        match core_transcode::execute(&opts, &sink_fn) {
+            Ok(summary) => {
+                sink.finish();
+                let before = summary.bytes_before as f64 / (1024.0 * 1024.0);
+                let after = summary.bytes_after as f64 / (1024.0 * 1024.0);
+                println!(
+                    "done: {} converted ({before:.1} MB -> {after:.1} MB), {} skipped, {} failed",
+                    summary.converted, summary.skipped, summary.failed
+                );
+                if summary.trashed > 0 {
+                    println!(
+                        "{} source(s) moved to {} - review with `trash`, then restore or delete",
+                        summary.trashed,
+                        core_trash::default_dir(&input).display()
+                    );
+                }
+                println!();
+                println!("next step in rekordbox: refresh the library root folder so the new");
+                println!("files are picked up (replacing a file in place keeps its path).");
+                i32::from(summary.failed > 0)
+            }
+            Err(e) => error_code(e),
+        }
+    }
+}
+
+fn print_transcode_report(plan: &core_transcode::Plan) {
+    let mb = |bytes: u64| bytes as f64 / (1024.0 * 1024.0);
+    let ready: Vec<&core_transcode::PlanEntry> = plan.actionable();
+    let convertable: u64 = ready.iter().map(|e| e.size).sum();
+    println!("transcode analysis");
+    println!("  input: {}", plan.input.display());
+    println!(
+        "  target: {}{}",
+        plan.target.label(),
+        match &plan.quality {
+            Some(q) => format!(" (quality {q})"),
+            None => String::new(),
+        }
+    );
+    println!(
+        "  output: {}",
+        match &plan.output {
+            Some(out) => out.display().to_string(),
+            None => "next to each source".to_string(),
+        }
+    );
+    if plan.replace {
+        println!("  sources: moved to {} after converting", plan.trash.display());
+    }
+    println!();
+    for (status, label) in [
+        ("ready", "convert"),
+        ("same-codec", "already the target codec"),
+        ("conflict", "conflict (target exists)"),
+        ("needs-replace", "needs --replace (same file name)"),
+    ] {
+        let n = plan.count(status);
+        if n > 0 {
+            println!("  {label:<32} {n}");
+        }
+    }
+    if plan.entries.is_empty() {
+        println!("  (no audio files found)");
+    }
+    for entry in &plan.entries {
+        if let Some(note) = &entry.note {
+            let codec = entry.src_codec.as_deref().unwrap_or("unknown codec");
+            println!(
+                "  - {} [{codec}, {:.1} MB]: {note}",
+                dj_music_core::scan::file_name(&entry.src),
+                mb(entry.size)
+            );
+        }
+    }
+    if ready.is_empty() {
+        println!();
+        println!("nothing to convert");
+    } else {
+        println!();
+        println!(
+            "with --execute: {} file(s) ({:.1} MB of sources) would be converted",
+            ready.len(),
+            mb(convertable)
+        );
+        if plan.count("same-codec") > 0 {
+            println!("files already in the target codec are skipped: re-encoding them");
+            println!("only loses quality.");
+        }
+    }
 }
 
 fn cmd_import(args: ImportArgs, sink: &TerminalSink) -> i32 {

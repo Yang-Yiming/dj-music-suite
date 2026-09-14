@@ -1,5 +1,9 @@
 <script lang="ts">
-  let { current = 0, total = 0 }: { current?: number; total?: number } = $props();
+  let {
+    current = 0,
+    total = 0,
+    tick = -1,
+  }: { current?: number; total?: number; tick?: number } = $props();
 
   const pct = $derived(total > 0 ? Math.min(100, (current / total) * 100) : 0);
 </script>
@@ -12,6 +16,6 @@
     ></div>
   </div>
   <span class="whitespace-nowrap text-xs text-slate-500 tabular-nums">
-    {current} / {total || "?"}
+    {current} / {total || "?"}{tick >= 0 ? ` · ${tick}%` : ""}
   </span>
 </div>

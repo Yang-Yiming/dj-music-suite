@@ -12,12 +12,15 @@ export const job = $state<{
   running: boolean;
   current: number;
   total: number;
+  /** progress inside the current item, 0..100; -1 when the job has none */
+  tick: number;
   log: LogLine[];
 }>({
   kind: null,
   running: false,
   current: 0,
   total: 0,
+  tick: -1,
   log: [],
 });
 
@@ -28,9 +31,14 @@ function applyEvent(ev: JobEvent) {
     case "start":
       job.total = ev.total;
       job.current = 0;
+      job.tick = -1;
       break;
     case "step":
       job.current += 1;
+      job.tick = -1;
+      break;
+    case "tick":
+      job.tick = ev.percent;
       break;
     case "line":
       job.log.push({ text: ev.text, warn: false });
@@ -52,6 +60,7 @@ export function watchJob(kind: string): Promise<EndPayload> {
   job.running = true;
   job.current = 0;
   job.total = 0;
+  job.tick = -1;
   job.log = [];
 
   return new Promise((resolve) => {
@@ -85,6 +94,7 @@ export function replaySnapshot(kind: string, events: JobEvent[]) {
   job.running = true;
   job.current = 0;
   job.total = 0;
+  job.tick = -1;
   job.log = [];
   for (const ev of events) applyEvent(ev);
 }
