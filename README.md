@@ -47,6 +47,13 @@ file is embedded as unsynced lyrics (USLT).
 Downloaded covers are cached into `--meta-dir` as `track-<musicId>.<ext>`, so
 later runs (including offline or with `--no-download`) pick them up locally.
 
+The Web convert tab has the same two output destinations as the CLI: keep the
+result in the app staging area for the import review, or choose
+`直接保存到指定目录` and write to an absolute output path. Direct output
+does not require a configured library root, refuses to overwrite an existing
+target file, and removes that batch's staging directory after a fully
+successful conversion. Failed conversions keep their staging batch for retry.
+
 ## cover
 
 Finds missing album artwork from metadata and embeds it in the audio file. The
@@ -327,6 +334,22 @@ The library-wide tabs keep their analyzed plans in server memory (the
 hash/score cache is reused when re-scanning), so a page reload restores the
 plan and any running job's progress, while restarting the server means
 analyzing again.
+
+### Web-local data
+
+The settings dialog shows the disk usage of everything the web UI created:
+staging batches, MusicBrainz/iTunes cover caches, web-managed `meta` cover
+directories, and the config file. Its cleanup action removes all staging and
+cover-cache data, plus every `meta` directory the web UI created or can still
+discover through a surviving `input-folder` batch pointer. Legacy `meta`
+directories without an ownership marker are shown separately before deletion.
+The config file and library-root setting can optionally be cleared too.
+
+Cleanup never removes library audio, source folders, or files in a
+user-selected direct-output directory. Newly created `meta` directories carry
+a `.dj-music-suite-web-owned` marker and are also recorded in
+`web-meta-dirs.json`, so they can be found after their staging batch is gone.
+The cleanup job is blocked while another job is running.
 
 ### dedup trash
 

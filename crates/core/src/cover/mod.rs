@@ -228,7 +228,7 @@ pub fn analyze(opts: &CoverOpts, sink: Sink) -> Result<Plan> {
             input.display()
         )));
     }
-    let cache_dir = opts.cache_dir.clone().unwrap_or_else(default_cache_dir);
+    let cache_dir = opts.cache_dir.clone().unwrap_or_else(cache_dir);
     let mut session =
         Session::new(cache_dir, opts.country.clone()).map_err(crate::Error::Runtime)?;
 
@@ -290,7 +290,7 @@ pub fn execute_with_options(plan: &Plan, options: &ExecuteOptions, sink: Sink) -
         })
         .collect();
     sink(&Event::Start(actionable.len() as u64));
-    let cache_dir = default_cache_dir();
+    let cache_dir = cache_dir();
     let session = Session::new(cache_dir, plan.country.clone())
         .map_err(|e| crate::Error::Runtime(e.to_string()))?;
 
@@ -403,8 +403,7 @@ pub fn preview_artwork(plan: &Plan, path: &Path, candidate: usize) -> Result<Art
             path.display()
         ))
     })?;
-    let session =
-        Session::new(default_cache_dir(), plan.country.clone()).map_err(crate::Error::Runtime)?;
+    let session = Session::new(cache_dir(), plan.country.clone()).map_err(crate::Error::Runtime)?;
     session.artwork(candidate).map_err(crate::Error::Runtime)
 }
 
@@ -1051,7 +1050,7 @@ fn temp_path(path: &Path) -> PathBuf {
     ))
 }
 
-fn default_cache_dir() -> PathBuf {
+pub fn cache_dir() -> PathBuf {
     dirs::cache_dir()
         .unwrap_or_else(std::env::temp_dir)
         .join("dj-music-suite")

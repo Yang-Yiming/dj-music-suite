@@ -3,6 +3,7 @@
 
 pub mod api;
 pub mod state;
+pub mod storage;
 
 use std::sync::Arc;
 

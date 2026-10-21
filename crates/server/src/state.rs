@@ -26,6 +26,7 @@ pub enum JobKind {
     TranscodeExecute,
     CoverAnalyze,
     CoverExecute,
+    StorageClear,
     TrashRestore,
     TrashDelete,
 }
@@ -44,6 +45,7 @@ impl JobKind {
             JobKind::TranscodeExecute => "transcode-execute",
             JobKind::CoverAnalyze => "cover-analyze",
             JobKind::CoverExecute => "cover-execute",
+            JobKind::StorageClear => "storage-clear",
             JobKind::TrashRestore => "trash-restore",
             JobKind::TrashDelete => "trash-delete",
         }

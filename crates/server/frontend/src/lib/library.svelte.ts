@@ -742,3 +742,33 @@ export async function restoreLibrary(): Promise<
   }
   return null;
 }
+
+/// Drop all in-memory plans/results after the storage-clear job removed the
+/// server-side plans and cache directories.
+export function resetLibraryAfterStorageCleanup() {
+  reorg.plan = null;
+  reorg.included = {};
+  reorg.result = null;
+  reorg.error = "";
+  reorg.executeError = "";
+  dedup.plan = null;
+  dedup.keepers = {};
+  dedup.result = null;
+  dedup.error = "";
+  dedup.executeError = "";
+  transcode.plan = null;
+  transcode.included = {};
+  transcode.result = null;
+  transcode.error = "";
+  transcode.executeError = "";
+  cover.plan = null;
+  cover.included = {};
+  cover.selections = {};
+  cover.result = null;
+  cover.error = "";
+  cover.executeError = "";
+  trash.listing = null;
+  trash.selected = {};
+  trash.result = null;
+  trash.error = "";
+}

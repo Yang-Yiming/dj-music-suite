@@ -1,8 +1,8 @@
 <script lang="ts">
   import { onMount } from "svelte";
   import { fileBasename, getConfig, setConfig } from "./lib/api";
-  import { restore } from "./lib/batch.svelte";
-  import { restoreLibrary } from "./lib/library.svelte";
+  import { clearBatchAfterStorageCleanup, restore } from "./lib/batch.svelte";
+  import { resetLibraryAfterStorageCleanup, restoreLibrary } from "./lib/library.svelte";
   import CoverPanel from "./lib/components/CoverPanel.svelte";
   import ConvertPanel from "./lib/components/ConvertPanel.svelte";
   import DedupPanel from "./lib/components/DedupPanel.svelte";
@@ -30,6 +30,12 @@
   async function saveLibraryRoot(root: string) {
     const saved = await setConfig(root);
     libraryRoot = saved.library_root;
+  }
+
+  function handleDataCleared(configCleared: boolean) {
+    clearBatchAfterStorageCleanup();
+    resetLibraryAfterStorageCleanup();
+    if (configCleared) libraryRoot = null;
   }
 
   onMount(async () => {
@@ -150,4 +156,5 @@
   {libraryRoot}
   onSave={saveLibraryRoot}
   onClose={() => (settingsOpen = false)}
+  onDataCleared={handleDataCleared}
 />

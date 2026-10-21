@@ -19,6 +19,7 @@ use dj_music_core::transcode as core_transcode;
 use dj_music_core::trash as core_trash;
 
 use crate::state::{start_job, JobKind, JobStatus, AppState};
+use crate::storage;
 
 /// Built frontend (crates/server/frontend/dist), embedded into release
 /// builds; debug builds read the folder live so a `bun run build` output is
@@ -52,6 +53,8 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/cover/execute", post(cover_execute))
         .route("/api/cover/plan", get(cover_plan))
         .route("/api/cover/artwork", get(cover_artwork))
+        .route("/api/storage", get(storage_inventory))
+        .route("/api/storage/clear", post(storage_clear))
         .route("/api/trash", get(trash_list))
         .route("/api/trash/restore", post(trash_restore))
         .route("/api/trash/delete", post(trash_delete))
@@ -305,6 +308,41 @@ fn count_ncm(dir: &Path) -> usize {
         .count()
 }
 
+fn probe_writable_dir(dir: &Path) -> Result<(), String> {
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let probe = dir.join(format!(".djms-write-test-{}-{stamp}", std::process::id()));
+    std::fs::write(&probe, b"ok").map_err(|e| e.to_string())?;
+    std::fs::remove_file(probe).map_err(|e| e.to_string())
+}
+
+fn convert_conflict(input: &Path, output: &Path) -> Option<PathBuf> {
+    let entries = std::fs::read_dir(input).ok()?;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_file()
+            || !path
+                .extension()
+                .and_then(|ext| ext.to_str())
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("ncm"))
+        {
+            continue;
+        }
+        let Some(stem) = path.file_stem() else {
+            continue;
+        };
+        for ext in ["mp3", "flac"] {
+            let target = output.join(stem).with_extension(ext);
+            if target.exists() {
+                return Some(target);
+            }
+        }
+    }
+    None
+}
+
 /// Best-effort detection of the NetEase Cloud Music download folder across
 /// platforms: the first candidate that exists and actually contains .ncm
 /// files wins.
@@ -404,6 +442,15 @@ async fn start_convert(
     };
     let threads = body.get("threads").and_then(|v| v.as_u64()).unwrap_or(8) as usize;
     let no_download = body.get("no_download").and_then(|v| v.as_bool()).unwrap_or(false);
+    let output_mode = body
+        .get("output_mode")
+        .and_then(|v| v.as_str())
+        .unwrap_or("staging");
+    let direct = match output_mode {
+        "staging" => false,
+        "direct" => true,
+        _ => return bad_request("output_mode 必须是 staging 或 direct"),
+    };
 
     // two batch kinds: uploaded files live in the staging dir itself, while
     // "from folder" batches carry an input-folder pointer and are read in
@@ -419,8 +466,48 @@ async fn start_convert(
             input = ncm_dir;
         }
     }
-    let out_dir = dir.join("converted");
+    let out_dir = if direct {
+        let Some(raw) = body
+            .get("output_dir")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        else {
+            return bad_request("直接输出模式需要 output_dir");
+        };
+        let output = PathBuf::from(raw);
+        if !output.is_absolute() {
+            return bad_request("output_dir 必须是绝对路径");
+        }
+        let created = std::fs::create_dir_all(&output);
+        if let Err(e) = created {
+            return bad_request(format!("无法创建输出目录 {}: {e}", output.display()));
+        }
+        let output = match std::fs::canonicalize(&output) {
+            Ok(path) if path.is_dir() => path,
+            Ok(_) => return bad_request(format!("输出路径不是目录: {}", output.display())),
+            Err(e) => return bad_request(format!("无法解析输出目录: {e}")),
+        };
+        let staging_root = std::fs::canonicalize(&state.paths.staging_root)
+            .unwrap_or_else(|_| state.paths.staging_root.clone());
+        if output == input || output.starts_with(&staging_root) {
+            return bad_request("输出目录不能与输入目录或 Web 暂存目录相同");
+        }
+        if let Err(e) = probe_writable_dir(&output) {
+            return bad_request(format!("输出目录不可写: {e}"));
+        }
+        if let Some(conflict) = convert_conflict(&input, &output) {
+            return bad_request(format!("输出文件已存在，拒绝覆盖: {}", conflict.display()));
+        }
+        output
+    } else {
+        dir.join("converted")
+    };
     let meta_dir = input.join("meta");
+    let layout = storage::Layout::from_paths(&state.paths);
+    if let Err(e) = storage::ensure_meta_dir(&layout, &meta_dir) {
+        return bad_request(format!("无法登记封面缓存目录 {}: {e}", meta_dir.display()));
+    }
     let opts = ConvertOpts {
         input,
         output: out_dir,
@@ -428,14 +515,24 @@ async fn start_convert(
         meta_dir: Some(meta_dir),
         no_download,
     };
+    let direct_output = direct.then(|| opts.output.clone());
+    let staging_dir = dir.clone();
 
     let result = start_job(&state, JobKind::Convert, Some(staging_id.clone()), move |sink: dj_music_core::Sink| {
         let summary = convert::run(opts, sink).map_err(|e| e.to_string())?;
+        let cleaned = if direct_output.is_some() && summary.failed == 0 {
+            std::fs::remove_dir_all(&staging_dir).is_ok()
+        } else {
+            false
+        };
         Ok(json!({
             "total": summary.total,
             "tagged": summary.tagged,
             "failed": summary.failed,
-            "output": "converted",
+            "output": if direct_output.is_some() { "direct" } else { "converted" },
+            "output_dir": direct_output,
+            "direct": direct_output.is_some(),
+            "cleaned": cleaned,
         }))
     });
     match result {
@@ -1166,6 +1263,61 @@ async fn dedup_plan(State(state): State<Arc<AppState>>) -> Response {
         .as_ref()
         .map(|(plan, stats)| dedup_plan_json(plan, *stats));
     Json(json!({ "plan": plan })).into_response()
+}
+
+// ---------- web-local storage ----------
+
+async fn storage_inventory(State(state): State<Arc<AppState>>) -> Response {
+    let layout = storage::Layout::from_paths(&state.paths);
+    match tokio::task::spawn_blocking(move || storage::inventory(&layout)).await {
+        Ok(Ok(inventory)) => Json(inventory).into_response(),
+        Ok(Err(e)) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("无法读取本地数据占用: {e}"),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("存储统计任务失败: {e}"),
+        )
+            .into_response(),
+    }
+}
+
+async fn storage_clear(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<serde_json::Value>,
+) -> Response {
+    let options: storage::ClearOptions = match serde_json::from_value(body) {
+        Ok(options) => options,
+        Err(e) => return bad_request(format!("清理选项无效: {e}")),
+    };
+    let layout = storage::Layout::from_paths(&state.paths);
+    let clear_config = options.config;
+    let state2 = Arc::clone(&state);
+    let result = start_job(
+        &state,
+        JobKind::StorageClear,
+        None,
+        move |sink: dj_music_core::Sink| {
+            sink(&dj_music_core::Event::Start(1));
+            sink(&dj_music_core::Event::Line(
+                "[storage] clearing web-local data".into(),
+            ));
+            let summary = storage::clear(&layout, &options).map_err(|e| e.to_string())?;
+            *state2.library.lock() = Default::default();
+            state2.plans.lock().clear();
+            if clear_config {
+                *state2.config.lock() = dj_music_core::config::Config::default();
+            }
+            sink(&dj_music_core::Event::Step("local data".into()));
+            serde_json::to_value(summary).map_err(|e| e.to_string())
+        },
+    );
+    match result {
+        Ok(()) => Json(json!({"started": true})).into_response(),
+        Err(e) => conflict(e),
+    }
 }
 
 // ---------- trash ----------

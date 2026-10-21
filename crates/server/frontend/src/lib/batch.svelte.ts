@@ -107,11 +107,15 @@ export async function importFolder(path: string) {
   }
 }
 
-export async function doConvert(noDownload: boolean) {
+export async function doConvert(
+  noDownload: boolean,
+  outputMode: "staging" | "direct" = "staging",
+  outputDir = "",
+) {
   if (!batch.stagingId) return;
   batch.convertError = "";
   try {
-    await startConvert(batch.stagingId, noDownload);
+    await startConvert(batch.stagingId, noDownload, outputMode, outputDir);
     const end = await watchJob("convert");
     if (end.type === "done") {
       batch.convertDone = end.result as ConvertResult;
@@ -212,6 +216,13 @@ function clearLocalBatch() {
   batch.executeError = "";
 }
 
+/// Called after the storage-clear job: the staging directory and stored plans
+/// are gone, so the upload/convert/import batch must not stay on screen.
+export function clearBatchAfterStorageCleanup() {
+  clearLocalBatch();
+  batch.executeResult = null;
+}
+
 function applyEnd(kind: string, end: { type: string; result?: unknown; message?: string }) {
   if (end.type !== "done") {
     const message = end.message ?? "任务失败";
@@ -243,6 +254,17 @@ export async function restore(): Promise<"convert" | "import" | null> {
   // reorg/dedup jobs belong to the library store: claiming them here would
   // steal their event stream and focus the wrong tab
   if (!OWNED_KINDS[snapshot.kind]) return null;
+  // A direct-output conversion removes its staging directory and is not an
+  // import batch. Restoring it after a reload would leave an empty "ready"
+  // shell with no source files.
+  if (
+    snapshot.kind === "convert" &&
+    snapshot.result &&
+    (snapshot.result as ConvertResult).direct
+  ) {
+    clearLocalBatch();
+    return null;
+  }
   if (snapshot.staging_id) batch.stagingId = snapshot.staging_id;
   if (snapshot.status === "running") {
     const kind = snapshot.kind;

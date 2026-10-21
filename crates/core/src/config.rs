@@ -11,6 +11,7 @@ pub struct Config {
     pub library_root: Option<String>,
 }
 
+#[derive(Clone)]
 pub struct Paths {
     pub config_file: PathBuf,
     pub staging_root: PathBuf,

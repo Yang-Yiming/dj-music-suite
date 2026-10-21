@@ -25,7 +25,10 @@
       !batch.convertSkipped,
   );
   const importReady = $derived(
-    batch.stagingId !== null && !job.running && !needsConvertFirst,
+    batch.stagingId !== null &&
+      !job.running &&
+      !needsConvertFirst &&
+      !batch.convertDone?.direct,
   );
 
   const includedCount = $derived(
@@ -92,6 +95,15 @@
       >
         跳过转换
       </button>
+    </div>
+  {/if}
+
+  {#if batch.convertDone?.direct}
+    <div class="mt-4 rounded-lg border border-emerald-200 bg-emerald-50 p-3 text-sm text-emerald-800">
+      本次转换选择了“直接保存到指定目录”，结果没有进入曲库导入流程。
+      {#if batch.convertDone.output_dir}
+        <span class="mt-1 block break-all font-mono text-xs">{batch.convertDone.output_dir}</span>
+      {/if}
     </div>
   {/if}
 

@@ -34,6 +34,9 @@ export interface ConvertResult {
   tagged: number;
   failed: number;
   output: string;
+  output_dir?: string;
+  direct: boolean;
+  cleaned: boolean;
 }
 
 export interface ExecuteResult {
@@ -74,6 +77,7 @@ export type JobKind =
   | "transcode-execute"
   | "cover-analyze"
   | "cover-execute"
+  | "storage-clear"
   | "trash-restore"
   | "trash-delete";
 
@@ -257,11 +261,21 @@ export const useFolder = (path: string) =>
     body: JSON.stringify({ path }),
   });
 
-export const startConvert = (stagingId: string, noDownload: boolean) =>
+export const startConvert = (
+  stagingId: string,
+  noDownload: boolean,
+  outputMode: "staging" | "direct" = "staging",
+  outputDir = "",
+) =>
   call<{ started: boolean }>("/api/convert", {
     method: "POST",
     headers: jsonHeaders,
-    body: JSON.stringify({ staging_id: stagingId, no_download: noDownload }),
+    body: JSON.stringify({
+      staging_id: stagingId,
+      no_download: noDownload,
+      output_mode: outputMode,
+      output_dir: outputDir,
+    }),
   });
 
 export const startAnalyze = (stagingId: string, template: string) =>
@@ -490,6 +504,54 @@ export const getCoverPlan = () =>
 
 export const coverArtworkUrl = (path: string, candidate: number): string =>
   `/api/cover/artwork?path=${encodeURIComponent(path)}&candidate=${candidate}`;
+
+// ---------- web-local storage ----------
+
+export interface StorageUsage {
+  path: string;
+  bytes: number;
+  files: number;
+  batches: number;
+}
+
+export interface MetaStorageUsage {
+  path: string;
+  bytes: number;
+  files: number;
+  managed: boolean;
+}
+
+export interface StorageInventory {
+  config_file: string;
+  config_bytes: number;
+  staging: StorageUsage;
+  cache: StorageUsage;
+  meta: MetaStorageUsage[];
+  total_bytes: number;
+}
+
+export interface StorageClearResult {
+  freed_bytes: number;
+  staging_bytes: number;
+  cache_bytes: number;
+  meta_bytes: number;
+  meta_dirs: number;
+  config_removed: boolean;
+}
+
+export const getStorage = () => call<StorageInventory>("/api/storage");
+
+export const startStorageClear = (opts: {
+  staging: boolean;
+  cache: boolean;
+  meta: boolean;
+  config: boolean;
+}) =>
+  call<{ started: boolean }>("/api/storage/clear", {
+    method: "POST",
+    headers: jsonHeaders,
+    body: JSON.stringify(opts),
+  });
 
 // ---------- trash ----------
 

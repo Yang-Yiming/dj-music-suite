@@ -8,6 +8,8 @@
   import Progress from "./Progress.svelte";
 
   let noDownload = $state(false);
+  let outputMode = $state<"staging" | "direct">("staging");
+  let outputDir = $state("");
 
   const needsConvert = $derived(
     batch.stagingId !== null &&
@@ -93,19 +95,71 @@
     </button>
   </div>
 
-  {#if batch.counts.ncm === 0}
+  {#if batch.convertDone}
+    <p class="mt-4 text-sm text-emerald-700">
+      ✓ 转换完成：{batch.convertDone.total - batch.convertDone.failed} 个成功，{batch.convertDone.tagged}
+        个写入标签{batch.convertDone.failed ? `，${batch.convertDone.failed} 个失败（见日志）` : ""}。
+      {#if batch.convertDone.direct}
+        已直接保存到指定目录，未进入曲库导入流程。
+      {:else}
+        到「导入」标签写进曲库。
+      {/if}
+    </p>
+    {#if batch.convertDone.output_dir}
+      <p class="mt-1 break-all font-mono text-xs text-slate-500">{batch.convertDone.output_dir}</p>
+    {/if}
+    {#if job.log.length}
+      <LogPanel lines={job.log} />
+    {/if}
+  {:else if batch.convertSkipped}
+    <p class="mt-4 text-sm text-slate-500">已跳过转换</p>
+  {:else if batch.counts.ncm === 0}
     <p class="mt-4 text-sm text-slate-500">
       这批文件里没有 .ncm，不需要转换。音频文件可以直接到「导入」标签处理。
     </p>
   {:else if needsConvert}
     <p class="mt-4 text-sm text-slate-600">
-      解密 {batch.counts.ncm} 个 .ncm 文件。转换结果会暂存在本机，稍后在「导入」标签写进曲库。
+      解密 {batch.counts.ncm} 个 .ncm 文件。
+      选择“暂存并导入”时会先写进 Web 暂存目录；选择“直接保存”时写入你指定的目录，不进入导入流程。
     </p>
+    <div class="mt-3 grid gap-3 rounded-lg bg-slate-50 p-3 text-xs text-slate-600">
+      <label class="flex items-center gap-2">
+        <input
+          class="accent-blue-600"
+          type="radio"
+          name="convert-output-mode"
+          value="staging"
+          bind:group={outputMode}
+        />
+        暂存，稍后在「导入」标签写进曲库
+      </label>
+      <label class="flex items-center gap-2">
+        <input
+          class="accent-blue-600"
+          type="radio"
+          name="convert-output-mode"
+          value="direct"
+          bind:group={outputMode}
+        />
+        直接保存到指定目录（不要求曲库位置）
+      </label>
+      {#if outputMode === "direct"}
+        <label class="flex flex-col gap-1">
+          输出目录（必须是绝对路径；不存在时会自动创建）
+          <input
+            class="rounded-lg border border-slate-300 px-2.5 py-1.5 font-mono text-xs focus:border-blue-500 focus:outline-none"
+            type="text"
+            placeholder="/Users/you/Desktop/converted"
+            bind:value={outputDir}
+          />
+        </label>
+      {/if}
+    </div>
     <div class="mt-3 flex items-center gap-4">
       <button
         class="rounded-lg bg-blue-600 px-4 py-2 text-sm font-medium text-white hover:bg-blue-700 disabled:opacity-50"
-        disabled={job.running}
-        onclick={() => doConvert(noDownload)}
+        disabled={job.running || (outputMode === "direct" && !outputDir.trim())}
+        onclick={() => doConvert(noDownload, outputMode, outputDir.trim())}
       >
         开始转换
       </button>
@@ -123,16 +177,5 @@
         <LogPanel lines={job.log} />
       </div>
     {/if}
-  {:else if batch.convertDone}
-    <p class="mt-4 text-sm text-emerald-700">
-      ✓ 转换完成：{batch.convertDone.total - batch.convertDone.failed} 个成功，{batch.convertDone.tagged}
-        个写入标签{batch.convertDone.failed ? `，${batch.convertDone.failed} 个失败（见日志）` : ""}。
-        到「导入」标签写进曲库。
-    </p>
-    {#if job.log.length}
-      <LogPanel lines={job.log} />
-    {/if}
-  {:else if batch.convertSkipped}
-    <p class="mt-4 text-sm text-slate-500">已跳过转换</p>
   {/if}
 {/if}
