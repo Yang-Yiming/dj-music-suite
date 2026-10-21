@@ -8,6 +8,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::{Cursor, Read};
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use lofty::config::WriteOptions;
@@ -31,6 +32,7 @@ const MAX_IMAGE_BYTES: usize = 12 * 1024 * 1024;
 const MAX_IMAGE_DIMENSION: u32 = 4096;
 const SEARCH_CACHE_TTL: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 const ARTWORK_FAILURE_TTL: Duration = Duration::from_secs(24 * 60 * 60);
+static HTTP_CLIENT: OnceLock<std::result::Result<Client, String>> = OnceLock::new();
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -157,6 +159,17 @@ pub struct Summary {
     pub failed: usize,
 }
 
+/// Per-run choices supplied by the web UI. The CLI can use [`execute`]; the UI
+/// sends an explicit subset and may override a review candidate selected by
+/// the user in the preview table.
+#[derive(Clone, Debug, Default)]
+pub struct ExecuteOptions {
+    /// Paths to process. None means every actionable entry in the plan.
+    pub include: Option<BTreeSet<PathBuf>>,
+    /// Path -> candidate index chosen by the user, including review rows.
+    pub selections: BTreeMap<PathBuf, usize>,
+}
+
 pub struct CoverOpts {
     /// A file or directory. None uses the library root configured by the web UI.
     pub input: Option<PathBuf>,
@@ -262,20 +275,46 @@ pub fn analyze(opts: &CoverOpts, sink: Sink) -> Result<Plan> {
 }
 
 pub fn execute(plan: &Plan, sink: Sink) -> Result<Summary> {
-    let actionable = plan.actionable();
+    execute_with_options(plan, &ExecuteOptions::default(), sink)
+}
+
+pub fn execute_with_options(plan: &Plan, options: &ExecuteOptions, sink: Sink) -> Result<Summary> {
+    let actionable: Vec<&Entry> = plan
+        .entries
+        .iter()
+        .filter(|entry| {
+            options
+                .include
+                .as_ref()
+                .is_none_or(|include| include.contains(&entry.path))
+        })
+        .collect();
     sink(&Event::Start(actionable.len() as u64));
     let cache_dir = default_cache_dir();
     let session = Session::new(cache_dir, plan.country.clone())
         .map_err(|e| crate::Error::Runtime(e.to_string()))?;
 
     let mut summary = Summary::default();
-    for entry in &plan.entries {
-        if entry.status != Status::Ready {
+    for entry in actionable {
+        let explicit_selection = options.selections.get(&entry.path).copied();
+        if entry.status != Status::Ready && explicit_selection.is_none() {
             summary.skipped += 1;
             continue;
         }
-        let Some(candidate) = entry.selected_candidate() else {
-            summary.skipped += 1;
+        let Some(candidate) = explicit_selection
+            .or(entry.selected)
+            .and_then(|index| entry.candidates.get(index))
+        else {
+            if explicit_selection.is_some() {
+                summary.failed += 1;
+                sink(&Event::Warn(format!(
+                    "[fail] {}: selected candidate is out of range",
+                    entry.path.display()
+                )));
+            } else {
+                summary.skipped += 1;
+            }
+            sink(&Event::Step(file_name(&entry.path)));
             continue;
         };
 
@@ -342,6 +381,31 @@ pub fn execute(plan: &Plan, sink: Sink) -> Result<Summary> {
         sink(&Event::Step(file_name(&entry.path)));
     }
     Ok(summary)
+}
+
+/// Fetch (or reuse from the artwork cache) one candidate from an analyzed
+/// plan. The web UI uses this as a local image proxy, so the browser only
+/// talks to 127.0.0.1 and arbitrary URLs can never be supplied by the caller.
+pub fn preview_artwork(plan: &Plan, path: &Path, candidate: usize) -> Result<Artwork> {
+    let entry = plan
+        .entries
+        .iter()
+        .find(|entry| entry.path == path)
+        .ok_or_else(|| {
+            usage(format!(
+                "file is not in this cover plan: {}",
+                path.display()
+            ))
+        })?;
+    let candidate = entry.candidates.get(candidate).ok_or_else(|| {
+        usage(format!(
+            "candidate {candidate} is out of range for {}",
+            path.display()
+        ))
+    })?;
+    let session =
+        Session::new(default_cache_dir(), plan.country.clone()).map_err(crate::Error::Runtime)?;
+    session.artwork(candidate).map_err(crate::Error::Runtime)
 }
 
 pub fn load_plan(path: &Path) -> Result<Plan> {
@@ -999,15 +1063,20 @@ impl Session {
         fs::create_dir_all(cache_dir.join("artwork"))
             .and_then(|_| fs::create_dir_all(cache_dir.join("search")))
             .map_err(|e| format!("cannot create cover cache {}: {e}", cache_dir.display()))?;
-        let client = Client::builder()
-            .timeout(Duration::from_secs(25))
-            .redirect(reqwest::redirect::Policy::limited(6))
-            .user_agent(format!(
-                "dj-music-suite/{} (https://github.com/Yang-Yiming/dj-music-suite)",
-                env!("CARGO_PKG_VERSION")
-            ))
-            .build()
-            .map_err(|e| format!("cannot build HTTP client: {e}"))?;
+        let client = HTTP_CLIENT
+            .get_or_init(|| {
+                Client::builder()
+                    .timeout(Duration::from_secs(25))
+                    .redirect(reqwest::redirect::Policy::limited(6))
+                    .user_agent(format!(
+                        "dj-music-suite/{} (https://github.com/Yang-Yiming/dj-music-suite)",
+                        env!("CARGO_PKG_VERSION")
+                    ))
+                    .build()
+                    .map_err(|e| format!("cannot build HTTP client: {e}"))
+            })
+            .clone()
+            .map_err(|e| e.clone())?;
         Ok(Session {
             client,
             cache_dir,
@@ -1295,14 +1364,11 @@ impl Session {
     }
 }
 
-struct Artwork {
-    bytes: Vec<u8>,
-    #[allow(dead_code)]
-    mime: &'static str,
-    #[allow(dead_code)]
-    width: u32,
-    #[allow(dead_code)]
-    height: u32,
+pub struct Artwork {
+    pub bytes: Vec<u8>,
+    pub mime: &'static str,
+    pub width: u32,
+    pub height: u32,
 }
 
 struct ImageMeta {

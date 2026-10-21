@@ -3,6 +3,7 @@
   import { fileBasename, getConfig, setConfig } from "./lib/api";
   import { restore } from "./lib/batch.svelte";
   import { restoreLibrary } from "./lib/library.svelte";
+  import CoverPanel from "./lib/components/CoverPanel.svelte";
   import ConvertPanel from "./lib/components/ConvertPanel.svelte";
   import DedupPanel from "./lib/components/DedupPanel.svelte";
   import ImportPanel from "./lib/components/ImportPanel.svelte";
@@ -11,7 +12,7 @@
   import SettingsModal from "./lib/components/SettingsModal.svelte";
   import TranscodePanel from "./lib/components/TranscodePanel.svelte";
 
-  type Tab = "convert" | "import" | "reorg" | "dedup" | "transcode";
+  type Tab = "convert" | "import" | "reorg" | "dedup" | "transcode" | "cover";
 
   const TABS: { id: Tab; label: string }[] = [
     { id: "convert", label: "转换" },
@@ -19,6 +20,7 @@
     { id: "reorg", label: "整理" },
     { id: "dedup", label: "去重" },
     { id: "transcode", label: "转码" },
+    { id: "cover", label: "补封面" },
   ];
 
   let tab = $state<Tab>("convert");
@@ -62,7 +64,7 @@
   <div class="flex items-center justify-between">
     <div>
       <h1 class="text-xl font-bold tracking-tight">dj-music-suite</h1>
-      <p class="text-xs text-slate-500">本地曲库工具 · 数据不出你的电脑</p>
+      <p class="text-xs text-slate-500">本地曲库工具 · 音频不会上传</p>
     </div>
     <div class="flex items-center gap-3">
       {#if libraryRoot}
@@ -129,6 +131,11 @@
     <section class={cardClass(true)}>
       <h2 class="font-semibold">格式转码</h2>
       <TranscodePanel {libraryRoot} onNeedSettings={() => (settingsOpen = true)} />
+    </section>
+  {:else if tab === "cover"}
+    <section class={cardClass(true)}>
+      <h2 class="font-semibold">补专辑封面</h2>
+      <CoverPanel {libraryRoot} onNeedSettings={() => (settingsOpen = true)} />
     </section>
   {/if}
 </main>

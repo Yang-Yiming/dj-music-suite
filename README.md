@@ -267,9 +267,10 @@ running `dj-music-suite-web` for UI iteration.
 
 A local web UI covering the flows non-CLI users need: converting `.ncm`
 files, importing music into the library, reorganizing it, removing
-duplicates and transcoding formats. Everything stays on the machine — the
-server listens on `127.0.0.1` only, and files are uploaded into a local
-staging folder (never sent anywhere).
+duplicates, transcoding formats and filling in missing cover art. The server
+listens on `127.0.0.1` only, and files are uploaded into a local staging folder
+(never sent anywhere). Cover lookup is the only feature that makes outbound
+requests, and it sends metadata text only — never audio.
 
 ```bash
 ./target/release/dj-music-suite-web [--port 8765] [--no-open]
@@ -285,9 +286,9 @@ explicit confirmation (the same analyze → execute two-phase design as the
 CLI). Progress streams live into the page. `--no-open` skips launching the
 browser automatically.
 
-The 整理 (reorg), 去重 (dedup) and 转码 (transcode) tabs run the CLI's other
-commands on the configured library root, with the same analyze → review →
-execute split:
+The 整理 (reorg), 去重 (dedup), 转码 (transcode) and 补封面 (cover) tabs run
+the CLI's other commands on the configured library root, with the same
+analyze → review → execute split:
 
 - **整理** analyzes the root against a directory template and lists every file
   as move / rename / move+rename / in place / conflict / untagged, plus the
@@ -314,10 +315,18 @@ execute split:
   bar while a conversion runs. Executing with replace on leaves each source in
   `<root>/.dedup-trash/transcoded/`, so it appears in the 去重 tab's trash
   list and can be restored like any dedup loser.
+- **补封面** scans the library (or a single file/subfolder) for missing
+  artwork, searches MusicBrainz/Cover Art Archive and iTunes, and shows the
+  selected candidate with a local thumbnail. `ready` rows are ticked by
+  default; `review` rows stay unticked until the user chooses a candidate and
+  opts in. The configured confidence threshold controls only automatic
+  matches. Writing supports mp3/flac/m4a and uses the same atomic,
+  verify-before-replace path as the CLI.
 
-All three keep the analyzed plan in server memory (the hash/score cache is
-reused when re-scanning), so a page reload restores the plan and any running
-job's progress, while restarting the server means analyzing again.
+The library-wide tabs keep their analyzed plans in server memory (the
+hash/score cache is reused when re-scanning), so a page reload restores the
+plan and any running job's progress, while restarting the server means
+analyzing again.
 
 ### dedup trash
 

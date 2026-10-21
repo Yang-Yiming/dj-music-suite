@@ -5,6 +5,7 @@ use std::sync::Arc;
 use parking_lot::Mutex;
 
 use dj_music_core::config::{self, Config, Paths};
+use dj_music_core::cover as core_cover;
 use dj_music_core::dedup as core_dedup;
 use dj_music_core::import::ImportPlan;
 use dj_music_core::reorg as core_reorg;
@@ -23,6 +24,8 @@ pub enum JobKind {
     DedupExecute,
     TranscodeAnalyze,
     TranscodeExecute,
+    CoverAnalyze,
+    CoverExecute,
     TrashRestore,
     TrashDelete,
 }
@@ -39,6 +42,8 @@ impl JobKind {
             JobKind::DedupExecute => "dedup-execute",
             JobKind::TranscodeAnalyze => "transcode-analyze",
             JobKind::TranscodeExecute => "transcode-execute",
+            JobKind::CoverAnalyze => "cover-analyze",
+            JobKind::CoverExecute => "cover-execute",
             JobKind::TrashRestore => "trash-restore",
             JobKind::TrashDelete => "trash-delete",
         }
@@ -99,6 +104,8 @@ pub struct LibraryPlans {
     pub dedup_cache: std::collections::BTreeMap<String, core_dedup::CachedFile>,
     /// analyzed transcode plan (the web UI uses `ffmpeg` from $PATH)
     pub transcode: Option<core_transcode::Plan>,
+    /// analyzed cover plan; kept until an execute run consumes it
+    pub cover: Option<core_cover::Plan>,
 }
 
 pub struct AppState {

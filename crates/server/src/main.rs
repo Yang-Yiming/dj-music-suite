@@ -7,7 +7,7 @@ use clap::Parser;
     name = "dj-music-suite-web",
     version,
     about = "local web UI for dj-music-suite",
-    long_about = "dj-music-suite-web - local web UI for dj-music-suite\n\nServes the dj-music-suite web interface on 127.0.0.1 and opens it in the\nbrowser. Files are uploaded into a local staging folder; nothing leaves the\nmachine. Set the music library root once on the page (stored in the app\nconfig dir), then convert .ncm files and import into the library with\nduplicate detection."
+    long_about = "dj-music-suite-web - local web UI for dj-music-suite\n\nServes the dj-music-suite web interface on 127.0.0.1 and opens it in the\nbrowser. Files stay local; the optional cover lookup sends only artist/title/\nalbum text to MusicBrainz, Cover Art Archive and iTunes. Set the music library\nroot once on the page (stored in the app config dir), then convert .ncm files,\nimport into the library with duplicate detection, or fill in missing artwork."
 )]
 struct ServeArgs {
     /// port to listen on (127.0.0.1 only)

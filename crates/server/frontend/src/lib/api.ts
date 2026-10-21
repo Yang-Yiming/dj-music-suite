@@ -72,6 +72,8 @@ export type JobKind =
   | "dedup-execute"
   | "transcode-analyze"
   | "transcode-execute"
+  | "cover-analyze"
+  | "cover-execute"
   | "trash-restore"
   | "trash-delete";
 
@@ -410,6 +412,85 @@ export const getTranscodePlan = () =>
 
 export const getFfmpeg = () => call<FfmpegStatus>("/api/transcode/ffmpeg");
 
+// ---------- cover ----------
+
+export type CoverProvider = "auto" | "musicbrainz" | "itunes";
+export type CoverStatus = "existing" | "ready" | "review" | "not-found" | "unsupported" | "error";
+
+export interface CoverCandidate {
+  provider: Exclude<CoverProvider, "auto">;
+  provider_id: string;
+  artist?: string;
+  title?: string;
+  album?: string;
+  year?: string;
+  duration_secs?: number;
+  artwork_url: string;
+  score: number;
+  note?: string;
+}
+
+export interface CoverEntry {
+  path: string;
+  size: number;
+  mtime_nanos: number;
+  artist?: string;
+  title?: string;
+  album?: string;
+  duration_secs?: number;
+  has_cover: boolean;
+  status: CoverStatus;
+  candidates: CoverCandidate[];
+  selected?: number;
+  note?: string;
+}
+
+export interface CoverPlan {
+  input: string;
+  provider: CoverProvider;
+  min_confidence: number;
+  overwrite: boolean;
+  country: string;
+  entries: CoverEntry[];
+}
+
+export interface CoverResult {
+  embedded: number;
+  replaced: number;
+  skipped: number;
+  failed: number;
+}
+
+export const startCoverAnalyze = (opts: {
+  /** empty = the configured library root */
+  input: string;
+  provider: CoverProvider;
+  min_confidence: number;
+  country: string;
+  overwrite: boolean;
+}) =>
+  call<{ started: boolean }>("/api/cover/analyze", {
+    method: "POST",
+    headers: jsonHeaders,
+    body: JSON.stringify(opts),
+  });
+
+export const startCoverExecute = (
+  include: string[],
+  selections: Record<string, number>,
+) =>
+  call<{ started: boolean }>("/api/cover/execute", {
+    method: "POST",
+    headers: jsonHeaders,
+    body: JSON.stringify({ include, selections }),
+  });
+
+export const getCoverPlan = () =>
+  call<{ plan: CoverPlan | null }>("/api/cover/plan");
+
+export const coverArtworkUrl = (path: string, candidate: number): string =>
+  `/api/cover/artwork?path=${encodeURIComponent(path)}&candidate=${candidate}`;
+
 // ---------- trash ----------
 
 export const getTrash = () => call<TrashListing>("/api/trash");
@@ -484,6 +565,21 @@ export const TRANSCODE_STATUS_LABELS: Record<TranscodeStatus, string> = {
   "same-codec": "已是目标格式",
   "conflict": "目标已存在",
   "needs-replace": "需要「转完后移入回收站」",
+};
+
+export const COVER_PROVIDER_LABELS: Record<CoverProvider, string> = {
+  auto: "自动（MusicBrainz → iTunes）",
+  musicbrainz: "MusicBrainz / Cover Art Archive",
+  itunes: "iTunes",
+};
+
+export const COVER_STATUS_LABELS: Record<CoverStatus, string> = {
+  existing: "已有封面",
+  ready: "可写入",
+  review: "需要确认",
+  "not-found": "未找到",
+  unsupported: "格式不支持",
+  error: "读取失败",
 };
 
 /// Rows the reorg table ticks by default: only what can actually move, and

@@ -2,7 +2,7 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use axum::extract::{Multipart, Path as AxPath, State};
+use axum::extract::{Multipart, Path as AxPath, Query, State};
 use axum::http::{header, StatusCode};
 use axum::response::sse::{Event as SseEvent, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
@@ -11,6 +11,7 @@ use axum::Router;
 use serde_json::json;
 
 use dj_music_core::convert::{self, ConvertOpts};
+use dj_music_core::cover as core_cover;
 use dj_music_core::dedup as core_dedup;
 use dj_music_core::import::{self as core_import, Mode};
 use dj_music_core::reorg as core_reorg;
@@ -47,6 +48,10 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/transcode/execute", post(transcode_execute))
         .route("/api/transcode/plan", get(transcode_plan))
         .route("/api/transcode/ffmpeg", get(transcode_ffmpeg))
+        .route("/api/cover/analyze", post(cover_analyze))
+        .route("/api/cover/execute", post(cover_execute))
+        .route("/api/cover/plan", get(cover_plan))
+        .route("/api/cover/artwork", get(cover_artwork))
         .route("/api/trash", get(trash_list))
         .route("/api/trash/restore", post(trash_restore))
         .route("/api/trash/delete", post(trash_delete))
@@ -770,6 +775,175 @@ async fn transcode_plan(State(state): State<Arc<AppState>>) -> Response {
         .as_ref()
         .map(transcode_plan_json);
     Json(json!({ "plan": plan })).into_response()
+}
+
+fn cover_provider(value: Option<&str>) -> core_cover::Provider {
+    match value.unwrap_or("auto") {
+        "musicbrainz" => core_cover::Provider::MusicBrainz,
+        "itunes" => core_cover::Provider::Itunes,
+        _ => core_cover::Provider::Auto,
+    }
+}
+
+fn cover_path(value: &str) -> PathBuf {
+    // Plans store canonical paths, while a browser or curl caller may use a
+    // symlinked spelling such as /tmp on macOS. Normalize when possible.
+    std::fs::canonicalize(value).unwrap_or_else(|_| PathBuf::from(value))
+}
+
+async fn cover_analyze(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<serde_json::Value>,
+) -> Response {
+    let input = body
+        .get("input")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from);
+    let provider = cover_provider(body.get("provider").and_then(|v| v.as_str()));
+    let min_confidence = body
+        .get("min_confidence")
+        .and_then(|v| v.as_f64())
+        .unwrap_or(core_cover::DEFAULT_MIN_CONFIDENCE as f64) as f32;
+    let country = body
+        .get("country")
+        .and_then(|v| v.as_str())
+        .unwrap_or("US")
+        .to_string();
+    let overwrite = body
+        .get("overwrite")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    let state2 = Arc::clone(&state);
+    let result = start_job(
+        &state,
+        JobKind::CoverAnalyze,
+        None,
+        move |sink: dj_music_core::Sink| {
+            let opts = core_cover::CoverOpts {
+                input,
+                provider,
+                min_confidence,
+                overwrite,
+                country,
+                // the web keeps the plan in memory instead of writing a file
+                plan: None,
+                cache_dir: None,
+            };
+            let plan = core_cover::analyze(&opts, sink).map_err(|e| e.to_string())?;
+            let value = serde_json::to_value(&plan).map_err(|e| e.to_string())?;
+            state2.library.lock().cover = Some(plan);
+            Ok(value)
+        },
+    );
+    match result {
+        Ok(()) => Json(json!({"started": true})).into_response(),
+        Err(e) => conflict(e),
+    }
+}
+
+async fn cover_execute(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<serde_json::Value>,
+) -> Response {
+    let Some(items) = body.get("include").and_then(|v| v.as_array()) else {
+        return bad_request("缺少 include（要写入封面的条目列表）");
+    };
+    let include: BTreeSet<PathBuf> = items
+        .iter()
+        .filter_map(|v| v.as_str())
+        .map(cover_path)
+        .collect();
+    let mut selections = std::collections::BTreeMap::new();
+    if let Some(map) = body.get("selections").and_then(|v| v.as_object()) {
+        for (path, value) in map {
+            let Some(index) = value.as_u64() else {
+                return bad_request(format!("候选序号无效: {path}"));
+            };
+            selections.insert(cover_path(path), index as usize);
+        }
+    }
+    let plan = state.library.lock().cover.clone();
+    let Some(plan) = plan else {
+        return bad_request("请先运行封面分析");
+    };
+
+    let state2 = Arc::clone(&state);
+    let result = start_job(
+        &state,
+        JobKind::CoverExecute,
+        None,
+        move |sink: dj_music_core::Sink| {
+            let options = core_cover::ExecuteOptions {
+                include: Some(include),
+                selections,
+            };
+            let summary = core_cover::execute_with_options(&plan, &options, sink)
+                .map_err(|e| e.to_string())?;
+            // the plan described the files as they were before writing; a
+            // reload should not offer to apply the same rows again
+            state2.library.lock().cover = None;
+            Ok(json!({
+                "embedded": summary.embedded,
+                "replaced": summary.replaced,
+                "skipped": summary.skipped,
+                "failed": summary.failed,
+            }))
+        },
+    );
+    match result {
+        Ok(()) => Json(json!({"started": true})).into_response(),
+        Err(e) => conflict(e),
+    }
+}
+
+async fn cover_plan(State(state): State<Arc<AppState>>) -> Response {
+    let plan = state.library.lock().cover.clone();
+    Json(json!({ "plan": plan })).into_response()
+}
+
+async fn cover_artwork(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> Response {
+    let Some(path) = params.get("path") else {
+        return bad_request("缺少 path");
+    };
+    let Ok(candidate) = params
+        .get("candidate")
+        .map(String::as_str)
+        .unwrap_or("0")
+        .parse::<usize>()
+    else {
+        return bad_request("candidate 必须是数字");
+    };
+    let plan = state.library.lock().cover.clone();
+    let Some(plan) = plan else {
+        return (StatusCode::NOT_FOUND, "cover plan not found").into_response();
+    };
+    let path = cover_path(path);
+    let result = tokio::task::spawn_blocking(move || {
+        core_cover::preview_artwork(&plan, &path, candidate)
+    })
+    .await;
+    match result {
+        Ok(Ok(artwork)) => (
+            [
+                (header::CONTENT_TYPE, artwork.mime),
+                (header::CACHE_CONTROL, "private, max-age=3600"),
+            ],
+            artwork.bytes,
+        )
+            .into_response(),
+        Ok(Err(e)) => (StatusCode::NOT_FOUND, e.to_string()).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("artwork task failed: {e}"),
+        )
+            .into_response(),
+    }
 }
 
 async fn reorg_analyze(

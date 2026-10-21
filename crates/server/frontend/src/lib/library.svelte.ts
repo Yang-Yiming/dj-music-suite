@@ -4,6 +4,7 @@
 
 import {
   deleteTrash,
+  getCoverPlan,
   getDedupPlan,
   getFfmpeg,
   getJob,
@@ -12,12 +13,17 @@ import {
   getTrash,
   reorgDefaultIncluded,
   restoreTrash,
+  startCoverAnalyze,
+  startCoverExecute,
   startDedupAnalyze,
   startDedupExecute,
   startReorgAnalyze,
   startReorgExecute,
   startTranscodeAnalyze,
   startTranscodeExecute,
+  type CoverPlan,
+  type CoverProvider,
+  type CoverResult,
   type DedupPlan,
   type DedupResult,
   type FfmpegStatus,
@@ -98,6 +104,39 @@ export const transcode = $state<{
   ffmpeg: null,
   plan: null,
   included: {},
+  error: "",
+  waiting: false,
+  executing: false,
+  result: null,
+  executeError: "",
+});
+
+export const cover = $state<{
+  /** empty = configured library root */
+  input: string;
+  provider: CoverProvider;
+  minConfidence: number;
+  country: string;
+  overwrite: boolean;
+  plan: CoverPlan | null;
+  /** path -> ticked in the result table */
+  included: Record<string, boolean>;
+  /** path -> candidate index, including explicit choices for review rows */
+  selections: Record<string, number>;
+  error: string;
+  waiting: boolean;
+  executing: boolean;
+  result: CoverResult | null;
+  executeError: string;
+}>({
+  input: "",
+  provider: "auto",
+  minConfidence: 0.88,
+  country: "US",
+  overwrite: false,
+  plan: null,
+  included: {},
+  selections: {},
   error: "",
   waiting: false,
   executing: false,
@@ -421,6 +460,87 @@ export async function doTranscodeExecute() {
   }
 }
 
+export async function doCoverAnalyze() {
+  cover.error = "";
+  cover.waiting = true;
+  cover.result = null;
+  cover.executeError = "";
+  try {
+    await startCoverAnalyze({
+      input: cover.input.trim(),
+      provider: cover.provider,
+      min_confidence: cover.minConfidence,
+      country: cover.country.trim() || "US",
+      overwrite: cover.overwrite,
+    });
+    const end = await watchJob("cover-analyze");
+    if (end.type === "done") applyCoverPlan(end.result as CoverPlan);
+    else cover.error = end.type === "error" ? end.message : "没有收到封面分析任务";
+  } catch (e) {
+    cover.error = e instanceof Error ? e.message : String(e);
+  } finally {
+    cover.waiting = false;
+  }
+}
+
+function applyCoverPlan(plan: CoverPlan) {
+  cover.plan = plan;
+  cover.input = plan.input;
+  cover.included = {};
+  cover.selections = {};
+  for (const entry of plan.entries) {
+    cover.included[entry.path] = entry.status === "ready";
+    if (entry.candidates.length) {
+      cover.selections[entry.path] = entry.selected ?? 0;
+    }
+  }
+}
+
+export function coverCandidateIndex(path: string): number {
+  const entry = cover.plan?.entries.find((e) => e.path === path);
+  if (!entry?.candidates.length) return 0;
+  return cover.selections[path] ?? entry.selected ?? 0;
+}
+
+export function setCoverCandidate(path: string, index: number) {
+  cover.selections[path] = index;
+  // choosing a candidate is an explicit opt-in for a review row
+  cover.included[path] = true;
+}
+
+export async function doCoverExecute() {
+  if (!cover.plan) return;
+  cover.executing = true;
+  cover.executeError = "";
+  cover.result = null;
+  try {
+    const include = cover.plan.entries
+      .filter((entry) => cover.included[entry.path] && entry.candidates.length)
+      .map((entry) => entry.path);
+    if (!include.length) {
+      cover.executeError = "没有勾选任何可写入的条目";
+      return;
+    }
+    const selections: Record<string, number> = {};
+    for (const path of include) selections[path] = coverCandidateIndex(path);
+    await startCoverExecute(include, selections);
+    const end = await watchJob("cover-execute");
+    if (end.type === "done") {
+      cover.result = end.result as CoverResult;
+      // mtimes and embedded artwork changed: the analyzed table is stale
+      cover.plan = null;
+      cover.included = {};
+      cover.selections = {};
+    } else {
+      cover.executeError = end.type === "error" ? end.message : "没有收到封面写入任务";
+    }
+  } catch (e) {
+    cover.executeError = e instanceof Error ? e.message : String(e);
+  } finally {
+    cover.executing = false;
+  }
+}
+
 function applyTranscodeFinish(
   kind: JobSnapshot["kind"],
   end: { type: string; result?: unknown; message?: string },
@@ -435,6 +555,19 @@ function applyTranscodeFinish(
     transcode.result = end.result as TranscodeResult;
     refreshTrash();
   }
+}
+
+function applyCoverFinish(
+  kind: JobSnapshot["kind"],
+  end: { type: string; result?: unknown; message?: string },
+) {
+  if (end.type === "error") {
+    cover.error = end.message ?? "任务失败";
+    return;
+  }
+  if (end.type !== "done") return;
+  if (kind === "cover-analyze") applyCoverPlan(end.result as CoverPlan);
+  else cover.result = end.result as CoverResult;
 }
 
 /// Restore the reorg/dedup tab after a page reload (see [`restoreLibrary`]).
@@ -471,7 +604,9 @@ function applyDedupFinish(kind: JobSnapshot["kind"], end: { type: string; result
 ///
 /// A running job is resumed in the background: awaiting it here would keep
 /// the user on the default tab, without progress, until the job finished.
-export async function restoreLibrary(): Promise<"reorg" | "dedup" | "transcode" | null> {
+export async function restoreLibrary(): Promise<
+  "reorg" | "dedup" | "transcode" | "cover" | null
+> {
   let snapshot: JobSnapshot | { status: "idle" };
   try {
     snapshot = await getJob();
@@ -532,6 +667,26 @@ export async function restoreLibrary(): Promise<"reorg" | "dedup" | "transcode" 
     }
     return "transcode";
   }
+  if (
+    "kind" in snapshot &&
+    (snapshot.kind === "cover-analyze" || snapshot.kind === "cover-execute")
+  ) {
+    const kind = snapshot.kind;
+    if (snapshot.status === "running") {
+      cover.waiting = kind === "cover-analyze";
+      cover.executing = !cover.waiting;
+      resumeRunningJob(snapshot).then((end) => {
+        cover.waiting = false;
+        cover.executing = false;
+        applyCoverFinish(kind, end);
+      });
+    } else if (snapshot.status === "done") {
+      applyCoverFinish(kind, { type: "done", result: snapshot.result });
+    } else {
+      cover.error = snapshot.error ?? "任务失败";
+    }
+    return "cover";
+  }
   if ("kind" in snapshot && (snapshot.kind === "trash-restore" || snapshot.kind === "trash-delete")) {
     const restoring = snapshot.kind === "trash-restore";
     const finish = (end: { type: string; result?: unknown; message?: string }) => {
@@ -560,10 +715,11 @@ export async function restoreLibrary(): Promise<"reorg" | "dedup" | "transcode" 
   // whatever is sitting in the trash folder
   refreshTrash();
   try {
-    const [r, d, t] = await Promise.all([
+    const [r, d, t, c] = await Promise.all([
       getReorgPlan(),
       getDedupPlan(),
       getTranscodePlan(),
+      getCoverPlan(),
     ]);
     if (r.plan) {
       applyReorgPlan(r.plan);
@@ -576,6 +732,10 @@ export async function restoreLibrary(): Promise<"reorg" | "dedup" | "transcode" 
     if (t.plan) {
       applyTranscodePlan(t.plan);
       return "transcode";
+    }
+    if (c.plan) {
+      applyCoverPlan(c.plan);
+      return "cover";
     }
   } catch {
     // nothing to restore
