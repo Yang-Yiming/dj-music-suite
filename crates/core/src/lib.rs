@@ -8,6 +8,7 @@
 
 pub mod config;
 pub mod convert;
+pub mod cover;
 pub mod dedup;
 pub mod import;
 pub mod quality;

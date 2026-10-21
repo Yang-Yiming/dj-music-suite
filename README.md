@@ -10,6 +10,7 @@ folder on disk. Comes as a CLI and a local web UI.
 ```bash
 cargo build --release
 ./target/release/dj-music-suite convert --input <DIR> --output <DIR>
+./target/release/dj-music-suite cover --input <FILE_OR_DIR>
 ./target/release/dj-music-suite transcode --to mp3 --input <DIR>
 ./target/release/dj-music-suite import --input <DIR> --root <MUSIC_DIR>
 ./target/release/dj-music-suite reorg --root <MUSIC_DIR>
@@ -45,6 +46,42 @@ file is embedded as unsynced lyrics (USLT).
 
 Downloaded covers are cached into `--meta-dir` as `track-<musicId>.<ext>`, so
 later runs (including offline or with `--no-download`) pick them up locally.
+
+## cover
+
+Finds missing album artwork from metadata and embeds it in the audio file. The
+search uses MusicBrainz/Cover Art Archive first and falls back to iTunes when
+`--provider auto` cannot obtain a usable image. Only artist/title/album text is
+sent to those services; audio files are never uploaded. When tags are missing,
+an `Artist - Title` filename is used as a conservative fallback.
+
+```bash
+./target/release/dj-music-suite cover --input track.flac                 # analyze, write cover-plan.json
+./target/release/dj-music-suite cover --input track.flac --execute       # analyze, then embed high-confidence matches
+./target/release/dj-music-suite cover --input library/                  # whole library
+./target/release/dj-music-suite cover --execute --from cover-plan.json  # apply a reviewed plan
+```
+
+| Option | Description |
+| --- | --- |
+| `--input <FILE_OR_DIR>` | audio file or folder to scan (default: configured library root) |
+| `--provider <auto\|musicbrainz\|itunes>` | search source (default: `auto`) |
+| `--min-confidence <0.0..1.0>` | minimum score for automatic embedding (default: `0.88`) |
+| `--country <CC>` | iTunes storefront, falling back to US when empty (default: `US`) |
+| `--overwrite` | replace an existing cover (default: files with a cover are skipped) |
+| `--execute` | actually write the selected covers (default: analyze only) |
+| `--from <FILE>` | execute a reviewed plan instead of searching again |
+| `--plan <FILE>` | plan path (default: `cover-plan.json`) |
+
+Only high-confidence matches are marked ready; ambiguous results remain in
+`review` and are never written automatically. Existing labels such as
+`<BURN> - Single` returned by iTunes are normalized when scoring. The first
+version writes MP3, FLAC and M4A; AAC, WAV and AIFF are reported as
+unsupported instead of risking a broken tag. Search results are cached for
+seven days and downloaded artwork for longer, so repeated album runs do not
+hit the services again. Writes happen through a same-directory temporary copy;
+the original path is replaced atomically only after the new tag has been read
+back and verified.
 
 ## import
 

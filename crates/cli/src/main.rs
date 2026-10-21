@@ -8,6 +8,7 @@ use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use indicatif::{ProgressBar, ProgressStyle};
 
 use dj_music_core::convert::ConvertOpts;
+use dj_music_core::cover as core_cover;
 use dj_music_core::import::{self as core_import, Mode as CoreMode};
 use dj_music_core::transcode as core_transcode;
 use dj_music_core::{dedup as core_dedup, reorg as core_reorg, trash as core_trash, Event};
@@ -17,7 +18,7 @@ use dj_music_core::{dedup as core_dedup, reorg as core_reorg, trash as core_tras
     name = "dj-music-suite",
     version,
     about = "a suite of small tools for music files",
-    long_about = "dj-music-suite - a suite of small tools for music files\n\nDecryption is built in (ncm_core), no external binaries are needed.\nConverted files are tagged automatically when possible: title, artist and\nalbum come from the .ncm metadata; the cover comes from\n<meta-dir>/track-<musicId>.jpg, then the image embedded in the .ncm file, then\nthe albumPic URL (unless --no-download; downloads are cached into <meta-dir>);\na same-named .lrc file is embedded as unsynced lyrics (USLT).\n\n`import` copies (or moves) new audio files into the music library folder,\ndeduplicating against what is already there: same artist + title and a\nsimilar duration is skipped as a duplicate, a different duration is imported\nas an alternate version.\n\n`reorg` moves the files of a music library folder into a tag-based layout.\nIt only touches the filesystem: analyze first, then let rekordbox relink the\nmoved files via File -> Display All Missing Files -> Relocate.\n\n`transcode` re-encodes audio files into another format and is the only\ncommand that needs an external binary: ffmpeg is looked up on $PATH (or\npassed as --ffmpeg) and the target encoder is checked before anything runs.\nTags, cover art and lyrics are carried over; files that already are the\ntarget codec are skipped rather than re-encoded, and a source that would be\noverwritten by its own conversion is refused unless --replace moves it into\nthe trash folder first."
+    long_about = "dj-music-suite - a suite of small tools for music files\n\nDecryption is built in (ncm_core), no external binaries are needed.\nConverted files are tagged automatically when possible: title, artist and\nalbum come from the .ncm metadata; the cover comes from\n<meta-dir>/track-<musicId>.jpg, then the image embedded in the .ncm file, then\nthe albumPic URL (unless --no-download; downloads are cached into <meta-dir>);\na same-named .lrc file is embedded as unsynced lyrics (USLT).\n\n`import` copies (or moves) new audio files into the music library folder,\ndeduplicating against what is already there: same artist + title and a\nsimilar duration is skipped as a duplicate, a different duration is imported\nas an alternate version.\n\n`reorg` moves the files of a music library folder into a tag-based layout.\nIt only touches the filesystem: analyze first, then let rekordbox relink the\nmoved files via File -> Display All Missing Files -> Relocate.\n\n`transcode` re-encodes audio files into another format and is the only\ncommand that needs an external binary: ffmpeg is looked up on $PATH (or\npassed as --ffmpeg) and the target encoder is checked before anything runs.\nTags, cover art and lyrics are carried over; files that already are the\ntarget codec are skipped rather than re-encoded, and a source that would be\noverwritten by its own conversion is refused unless --replace moves it into\nthe trash folder first.\n\n`cover` finds missing album artwork by searching MusicBrainz/Cover Art Archive and falling back to iTunes. It only sends text queries (artist, title, album); audio files are never uploaded. Analysis writes a reviewable plan and only --execute embeds high-confidence matches into mp3/flac/m4a files."
 )]
 struct Cli {
     #[command(subcommand)]
@@ -30,6 +31,8 @@ enum Commands {
     Convert(ConvertArgs),
     /// transcode audio files into another format with ffmpeg
     Transcode(TranscodeArgs),
+    /// find and embed missing album artwork (analyze by default)
+    Cover(CoverArgs),
     /// copy new audio files into the music library with duplicate detection
     Import(ImportArgs),
     /// reorganize a music library folder on disk (analyze by default)
@@ -124,6 +127,58 @@ struct TranscodeArgs {
 
     /// plan json written by the analysis (and read back with --from)
     #[arg(long, value_name = "FILE", default_value = "transcode-plan.json")]
+    plan: PathBuf,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum CoverProviderArg {
+    Auto,
+    Musicbrainz,
+    Itunes,
+}
+
+impl From<CoverProviderArg> for core_cover::Provider {
+    fn from(value: CoverProviderArg) -> Self {
+        match value {
+            CoverProviderArg::Auto => core_cover::Provider::Auto,
+            CoverProviderArg::Musicbrainz => core_cover::Provider::MusicBrainz,
+            CoverProviderArg::Itunes => core_cover::Provider::Itunes,
+        }
+    }
+}
+
+#[derive(clap::Args)]
+struct CoverArgs {
+    /// audio file or folder to inspect (default: the configured library root)
+    #[arg(long, value_name = "FILE_OR_DIR")]
+    input: Option<PathBuf>,
+
+    /// cover search source; auto tries MusicBrainz first, then iTunes
+    #[arg(long, value_enum, default_value_t = CoverProviderArg::Auto)]
+    provider: CoverProviderArg,
+
+    /// minimum score for an automatic high-confidence match
+    #[arg(long, value_name = "0..1", default_value_t = core_cover::DEFAULT_MIN_CONFIDENCE)]
+    min_confidence: f32,
+
+    /// iTunes storefront country code
+    #[arg(long, value_name = "CC", default_value = "US")]
+    country: String,
+
+    /// replace an existing front cover (default: skip files that have one)
+    #[arg(long)]
+    overwrite: bool,
+
+    /// actually embed the selected covers (default: analyze only)
+    #[arg(long)]
+    execute: bool,
+
+    /// execute a previously written plan instead of analyzing again
+    #[arg(long, value_name = "FILE")]
+    from: Option<PathBuf>,
+
+    /// plan json written by the analysis (and read back with --from)
+    #[arg(long, value_name = "FILE", default_value = "cover-plan.json")]
     plan: PathBuf,
 }
 
@@ -377,6 +432,7 @@ fn main() {
     let code = match cli.command {
         Some(Commands::Convert(args)) => cmd_convert(args, &sink),
         Some(Commands::Transcode(args)) => cmd_transcode(args, &sink),
+        Some(Commands::Cover(args)) => cmd_cover(args, &sink),
         Some(Commands::Import(args)) => cmd_import(args, &sink),
         Some(Commands::Reorg(args)) => cmd_reorg(args, &sink),
         Some(Commands::Dedup(args)) => cmd_dedup(args, &sink),
@@ -478,6 +534,137 @@ fn cmd_transcode(args: TranscodeArgs, sink: &TerminalSink) -> i32 {
         }
     }
 }
+
+fn cmd_cover(args: CoverArgs, sink: &TerminalSink) -> i32 {
+    if args.from.is_some() && !args.execute {
+        eprintln!("--from only makes sense together with --execute");
+        return 2;
+    }
+    let sink_fn = |e: &Event| sink.sink(e);
+    let plan = match args.from.as_deref() {
+        Some(path) => match core_cover::load_plan(path) {
+            Ok(plan) => plan,
+            Err(e) => return error_code(e),
+        },
+        None => {
+            let opts = core_cover::CoverOpts {
+                input: args.input,
+                provider: args.provider.into(),
+                min_confidence: args.min_confidence,
+                overwrite: args.overwrite,
+                country: args.country,
+                plan: Some(args.plan),
+                cache_dir: None,
+            };
+            match core_cover::analyze(&opts, &sink_fn) {
+                Ok(plan) => plan,
+                Err(e) => return error_code(e),
+            }
+        }
+    };
+    sink.finish();
+    print_cover_report(&plan);
+    if !args.execute {
+        return 0;
+    }
+    let summary = match core_cover::execute(&plan, &sink_fn) {
+        Ok(summary) => summary,
+        Err(e) => return error_code(e),
+    };
+    sink.finish();
+    println!(
+        "done: {} embedded, {} replaced, {} skipped, {} failed",
+        summary.embedded, summary.replaced, summary.skipped, summary.failed
+    );
+    println!();
+    println!("next step in rekordbox: refresh the affected tracks/album so the new");
+    println!("artwork is read from the embedded tags.");
+    i32::from(summary.failed > 0)
+}
+
+fn print_cover_report(plan: &core_cover::Plan) {
+    println!("cover analysis");
+    println!("  input: {}", plan.input.display());
+    println!("  provider: {}", plan.provider.label());
+    println!("  confidence: {:.2}", plan.min_confidence);
+    if plan.overwrite {
+        println!("  existing covers: replaced");
+    } else {
+        println!("  existing covers: skipped");
+    }
+    println!();
+    for (status, label) in [
+        (core_cover::Status::Ready, "ready to embed"),
+        (core_cover::Status::Existing, "already have a cover"),
+        (core_cover::Status::Review, "need manual review"),
+        (core_cover::Status::NotFound, "not found"),
+        (core_cover::Status::Unsupported, "format not supported"),
+        (core_cover::Status::Error, "unreadable/error"),
+    ] {
+        let count = plan.count(status);
+        if count > 0 {
+            println!("  {label:<28} {count}");
+        }
+    }
+    if plan.entries.is_empty() {
+        println!("  (no audio files found)");
+    }
+
+    for entry in &plan.entries {
+        match entry.status {
+            core_cover::Status::Ready => {
+                if let Some(candidate) = entry.selected_candidate() {
+                    println!(
+                        "  - {} -> {} / {} ({}, {:.2})",
+                        dj_music_core::scan::file_name(&entry.path),
+                        candidate.artist.as_deref().unwrap_or("?"),
+                        candidate.album.as_deref().unwrap_or("?"),
+                        candidate.provider.label(),
+                        candidate.score
+                    );
+                }
+            }
+            core_cover::Status::Review => {
+                let best = entry.candidates.first();
+                let detail = best
+                    .map(|candidate| {
+                        format!(
+                            "best: {} / {} ({}, {:.2})",
+                            candidate.artist.as_deref().unwrap_or("?"),
+                            candidate.album.as_deref().unwrap_or("?"),
+                            candidate.provider.label(),
+                            candidate.score
+                        )
+                    })
+                    .or_else(|| entry.note.clone())
+                    .unwrap_or_else(|| "ambiguous match".into());
+                println!(
+                    "  - {} [review] {detail}",
+                    dj_music_core::scan::file_name(&entry.path)
+                );
+            }
+            core_cover::Status::Unsupported | core_cover::Status::Error => {
+                println!(
+                    "  - {} [{}] {}",
+                    dj_music_core::scan::file_name(&entry.path),
+                    entry.status.as_str(),
+                    entry.note.as_deref().unwrap_or("")
+                );
+            }
+            core_cover::Status::Existing | core_cover::Status::NotFound => {}
+        }
+    }
+
+    let ready = plan.actionable().len();
+    if ready == 0 {
+        println!();
+        println!("nothing is ready to embed");
+    } else {
+        println!();
+        println!("with --execute: {ready} file(s) would get a front cover");
+    }
+}
+
 
 fn print_transcode_report(plan: &core_transcode::Plan) {
     let mb = |bytes: u64| bytes as f64 / (1024.0 * 1024.0);
