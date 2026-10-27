@@ -224,7 +224,7 @@
                       value={String(coverCandidateIndex(entry.path))}
                       onchange={(event) => setCoverCandidate(entry.path, Number(event.currentTarget.value))}
                     >
-                      {#each entry.candidates as item, index (item.provider + item.provider_id)}
+                      {#each entry.candidates as item, index}
                         <option value={String(index)}>
                           {item.artist ?? "?"} / {item.album ?? item.title ?? "?"} · {item.provider === "musicbrainz" ? "MB" : "iTunes"} · {item.score.toFixed(2)}
                         </option>

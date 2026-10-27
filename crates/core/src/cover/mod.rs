@@ -799,7 +799,16 @@ fn sort_and_dedupe(candidates: &mut Vec<Candidate>) {
             .then_with(|| a.artwork_url.cmp(&b.artwork_url))
     });
     let mut seen = BTreeSet::new();
+    let mut seen_covers = BTreeSet::new();
     candidates.retain(|candidate| {
+        // MusicBrainz returns one release group per track version, so the
+        // same front cover often shows up several times with different album
+        // names. Two candidates that point at the same image are the same
+        // choice for this feature; keeping both only creates duplicate rows
+        // in the UI (and duplicate list keys in the web client).
+        if !seen_covers.insert(candidate.artwork_url.clone()) {
+            return false;
+        }
         let key = format!(
             "{}|{}|{}",
             candidate.provider.label(),
@@ -1755,6 +1764,34 @@ mod tests {
         assert_eq!(clean_release_title("<BURN> - Single"), "<BURN>");
         assert_eq!(clean_release_title("Album - EP"), "Album");
         assert_eq!(clean_release_title("Live Album"), "Live Album");
+    }
+
+    #[test]
+    fn candidates_sharing_one_cover_are_collapsed() {
+        // MusicBrainz returns several releases (single, remix, EP) that all
+        // point at the same release-group artwork; the UI must not see two
+        // rows with an identical key.
+        let make = |id: &str, album: &str, score: f32, url: &str| Candidate {
+            provider: Provider::MusicBrainz,
+            provider_id: id.into(),
+            artist: Some("LE SSERAFIM".into()),
+            title: Some(album.into()),
+            album: Some(album.into()),
+            year: None,
+            duration_secs: None,
+            artwork_url: url.into(),
+            score,
+            note: None,
+        };
+        let mut candidates = vec![
+            make("same", "Perfect Night", 1.0, "https://example.test/a"),
+            make("same", "Perfect Night (remix)", 0.69, "https://example.test/a"),
+            make("other", "EASY", 0.43, "https://example.test/b"),
+        ];
+        sort_and_dedupe(&mut candidates);
+        assert_eq!(candidates.len(), 2);
+        assert_eq!(candidates[0].album.as_deref(), Some("Perfect Night"));
+        assert_eq!(candidates[1].album.as_deref(), Some("EASY"));
     }
 
     #[test]
