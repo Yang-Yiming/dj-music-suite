@@ -257,8 +257,15 @@ they can be deleted, but not restored.
 ## Building
 
 ```bash
-just build   # bun build of the web bundle, then cargo build --release
+make build   # bun build of the web bundle, then cargo build --release
+# same thing with just: just build
 ```
+
+`make` is enough on a stock macOS/Linux setup; `just` is optional. Both run
+the frontend bundle first because the web binary embeds `frontend/dist` at
+compile time. Building with plain `cargo build --release` still works, but the
+build script warns when the bundle is older than the frontend sources instead
+of silently shipping the previous UI.
 
 Outputs two binaries in `target/release/`:
 
@@ -267,8 +274,8 @@ Outputs two binaries in `target/release/`:
   `crates/server/frontend` (bun + Vite + Svelte + Tailwind), the built bundle
   is embedded into the binary, so the web app still ships as one file
 
-`just dev-web` runs the frontend dev server with a proxy to a locally
-running `dj-music-suite-web` for UI iteration.
+`just dev-web` (or `make dev-web`) runs the frontend dev server with a proxy
+to a locally running `dj-music-suite-web` for UI iteration.
 
 ## web ui
 
