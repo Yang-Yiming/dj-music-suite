@@ -484,11 +484,18 @@ export async function doCoverAnalyze() {
 }
 
 function applyCoverPlan(plan: CoverPlan) {
-  cover.plan = plan;
+  // The server skips `candidates` for entries that have none (serde
+  // `skip_serializing_if`), so normalize every row before the table starts
+  // reading `entry.candidates.length`.
+  const entries = plan.entries.map((entry) => ({
+    ...entry,
+    candidates: entry.candidates ?? [],
+  }));
+  cover.plan = { ...plan, entries };
   cover.input = plan.input;
   cover.included = {};
   cover.selections = {};
-  for (const entry of plan.entries) {
+  for (const entry of entries) {
     cover.included[entry.path] = entry.status === "ready";
     if (entry.candidates.length) {
       cover.selections[entry.path] = entry.selected ?? 0;
@@ -498,7 +505,7 @@ function applyCoverPlan(plan: CoverPlan) {
 
 export function coverCandidateIndex(path: string): number {
   const entry = cover.plan?.entries.find((e) => e.path === path);
-  if (!entry?.candidates.length) return 0;
+  if (!entry?.candidates?.length) return 0;
   return cover.selections[path] ?? entry.selected ?? 0;
 }
 
@@ -515,7 +522,7 @@ export async function doCoverExecute() {
   cover.result = null;
   try {
     const include = cover.plan.entries
-      .filter((entry) => cover.included[entry.path] && entry.candidates.length)
+      .filter((entry) => cover.included[entry.path] && (entry.candidates?.length ?? 0) > 0)
       .map((entry) => entry.path);
     if (!include.length) {
       cover.executeError = "没有勾选任何可写入的条目";

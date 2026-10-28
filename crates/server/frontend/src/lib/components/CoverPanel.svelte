@@ -49,18 +49,18 @@
   const selected = $derived.by(() => {
     const entries = cover.plan?.entries ?? [];
     return entries.filter(
-      (entry) => cover.included[entry.path] && entry.candidates.length > 0,
+      (entry) => cover.included[entry.path] && (entry.candidates?.length ?? 0) > 0,
     );
   });
 
-  const selectable = (entry: CoverEntry) => entry.candidates.length > 0;
+  const selectable = (entry: CoverEntry) => (entry.candidates?.length ?? 0) > 0;
 
   function toggle(entry: CoverEntry, checked: boolean) {
     cover.included[entry.path] = checked;
   }
 
   function selectedCandidate(entry: CoverEntry) {
-    return entry.candidates[coverCandidateIndex(entry.path)];
+    return entry.candidates?.[coverCandidateIndex(entry.path)];
   }
 </script>
 
@@ -218,7 +218,7 @@
                   <span class="block text-xs text-slate-400">{formatDuration(entry.duration_secs)}</span>
                 </td>
                 <td class="px-2 py-2">
-                  {#if entry.candidates.length}
+                  {#if entry.candidates?.length}
                     <select
                       class="w-full rounded-md border border-slate-300 px-2 py-1 text-xs focus:border-blue-500 focus:outline-none"
                       value={String(coverCandidateIndex(entry.path))}

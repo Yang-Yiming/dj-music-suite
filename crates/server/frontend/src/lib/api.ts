@@ -454,6 +454,10 @@ export interface CoverEntry {
   duration_secs?: number;
   has_cover: boolean;
   status: CoverStatus;
+  /**
+   * Absent on the wire when the server found no candidates (serde skips empty
+   * lists); `applyCoverPlan` normalizes it to `[]` before the UI sees a plan.
+   */
   candidates: CoverCandidate[];
   selected?: number;
   note?: string;
