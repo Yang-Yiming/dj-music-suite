@@ -14,6 +14,7 @@ use dj_music_core::convert::{self, ConvertOpts};
 use dj_music_core::cover as core_cover;
 use dj_music_core::dedup as core_dedup;
 use dj_music_core::import::{self as core_import, Mode};
+use dj_music_core::metadata as core_metadata;
 use dj_music_core::reorg as core_reorg;
 use dj_music_core::transcode as core_transcode;
 use dj_music_core::trash as core_trash;
@@ -53,6 +54,8 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/cover/execute", post(cover_execute))
         .route("/api/cover/plan", get(cover_plan))
         .route("/api/cover/artwork", get(cover_artwork))
+        .route("/api/metadata/scan", post(metadata_scan))
+        .route("/api/metadata/write", post(metadata_write))
         .route("/api/storage", get(storage_inventory))
         .route("/api/storage/clear", post(storage_clear))
         .route("/api/trash", get(trash_list))
@@ -1040,6 +1043,88 @@ async fn cover_artwork(
             format!("artwork task failed: {e}"),
         )
             .into_response(),
+    }
+}
+
+async fn metadata_scan(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<serde_json::Value>,
+) -> Response {
+    let input = body
+        .get("input")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from);
+    let input = match input.or_else(|| state.library_root()) {
+        Some(input) => input,
+        None => return bad_request("请填写歌曲或文件夹路径，或先在设置里配置曲库"),
+    };
+
+    let result = start_job(
+        &state,
+        JobKind::MetadataScan,
+        None,
+        move |sink: dj_music_core::Sink| {
+            let tracks = core_metadata::scan(&input, sink).map_err(|e| e.to_string())?;
+            serde_json::to_value(tracks).map_err(|e| e.to_string())
+        },
+    );
+    match result {
+        Ok(()) => Json(json!({"started": true})).into_response(),
+        Err(e) => conflict(e),
+    }
+}
+
+async fn metadata_write(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<serde_json::Value>,
+) -> Response {
+    let Some(path) = body
+        .get("path")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+    else {
+        return bad_request("缺少 path（要编辑的歌曲路径）");
+    };
+    let Some(expected_size) = body.get("expected_size").and_then(|v| v.as_u64()) else {
+        return bad_request("缺少 expected_size");
+    };
+    let Some(expected_mtime_nanos) = body
+        .get("expected_mtime_nanos")
+        .and_then(|v| v.as_str())
+        .and_then(|value| value.parse::<u64>().ok())
+    else {
+        return bad_request("缺少 expected_mtime_nanos");
+    };
+    let patch = match body.get("patch").cloned() {
+        Some(value) => match serde_json::from_value::<core_metadata::MetadataPatch>(value) {
+            Ok(patch) => patch,
+            Err(e) => return bad_request(format!("元信息修改内容无效: {e}")),
+        },
+        None => return bad_request("缺少 patch（要修改的元信息字段）"),
+    };
+
+    let result = start_job(
+        &state,
+        JobKind::MetadataWrite,
+        None,
+        move |_sink: dj_music_core::Sink| {
+            let track = core_metadata::update(
+                &path,
+                expected_size,
+                expected_mtime_nanos,
+                &patch,
+            )
+            .map_err(|e| e.to_string())?;
+            serde_json::to_value(track).map_err(|e| e.to_string())
+        },
+    );
+    match result {
+        Ok(()) => Json(json!({"started": true})).into_response(),
+        Err(e) => conflict(e),
     }
 }
 

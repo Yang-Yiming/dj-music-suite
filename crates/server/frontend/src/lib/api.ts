@@ -77,6 +77,8 @@ export type JobKind =
   | "transcode-execute"
   | "cover-analyze"
   | "cover-execute"
+  | "metadata-scan"
+  | "metadata-write"
   | "storage-clear"
   | "trash-restore"
   | "trash-delete";
@@ -508,6 +510,58 @@ export const getCoverPlan = () =>
 
 export const coverArtworkUrl = (path: string, candidate: number): string =>
   `/api/cover/artwork?path=${encodeURIComponent(path)}&candidate=${candidate}`;
+
+// ---------- track metadata ----------
+
+export interface TrackMetadata {
+  path: string;
+  size: number;
+  /** string because nanosecond timestamps exceed JS safe integer precision */
+  mtime_nanos: string;
+  format: string;
+  title?: string;
+  artist?: string;
+  album?: string;
+  album_artist?: string;
+  year?: string;
+  genre?: string;
+  track_number?: string;
+  disc_number?: string;
+  duration_secs?: number;
+  has_cover: boolean;
+  error?: string;
+}
+
+/** Only present fields are written; an empty string clears that field. */
+export interface MetadataPatch {
+  title?: string;
+  artist?: string;
+  album?: string;
+  album_artist?: string;
+  year?: string;
+  genre?: string;
+  track_number?: string;
+  disc_number?: string;
+}
+
+export const startMetadataScan = (input: string) =>
+  call<{ started: boolean }>("/api/metadata/scan", {
+    method: "POST",
+    headers: jsonHeaders,
+    body: JSON.stringify({ input }),
+  });
+
+export const startMetadataWrite = (request: {
+  path: string;
+  expected_size: number;
+  expected_mtime_nanos: string;
+  patch: MetadataPatch;
+}) =>
+  call<{ started: boolean }>("/api/metadata/write", {
+    method: "POST",
+    headers: jsonHeaders,
+    body: JSON.stringify(request),
+  });
 
 // ---------- web-local storage ----------
 

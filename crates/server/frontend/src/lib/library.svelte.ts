@@ -38,6 +38,7 @@ import {
   type TrashResult,
 } from "./api";
 import { resumeRunningJob, watchJob } from "./job.svelte";
+import { applyMetadataFinish, metadata } from "./metadata.svelte";
 
 export const reorg = $state<{
   template: string;
@@ -612,7 +613,7 @@ function applyDedupFinish(kind: JobSnapshot["kind"], end: { type: string; result
 /// A running job is resumed in the background: awaiting it here would keep
 /// the user on the default tab, without progress, until the job finished.
 export async function restoreLibrary(): Promise<
-  "reorg" | "dedup" | "transcode" | "cover" | null
+  "reorg" | "dedup" | "transcode" | "cover" | "metadata" | null
 > {
   let snapshot: JobSnapshot | { status: "idle" };
   try {
@@ -693,6 +694,27 @@ export async function restoreLibrary(): Promise<
       cover.error = snapshot.error ?? "任务失败";
     }
     return "cover";
+  }
+  if (
+    "kind" in snapshot &&
+    (snapshot.kind === "metadata-scan" || snapshot.kind === "metadata-write")
+  ) {
+    const kind = snapshot.kind;
+    if (snapshot.status === "running") {
+      metadata.scanning = kind === "metadata-scan";
+      metadata.saving = kind === "metadata-write";
+      resumeRunningJob(snapshot).then((end) => {
+        metadata.scanning = false;
+        metadata.saving = false;
+        applyMetadataFinish(kind, end);
+      });
+    } else if (snapshot.status === "done") {
+      applyMetadataFinish(kind, { type: "done", result: snapshot.result });
+    } else {
+      if (kind === "metadata-scan") metadata.error = snapshot.error ?? "任务失败";
+      else metadata.writeError = snapshot.error ?? "任务失败";
+    }
+    return "metadata";
   }
   if ("kind" in snapshot && (snapshot.kind === "trash-restore" || snapshot.kind === "trash-delete")) {
     const restoring = snapshot.kind === "trash-restore";

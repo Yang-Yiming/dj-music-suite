@@ -1,9 +1,9 @@
 # dj-music-suite
 
 Small tools for DJ music libraries: convert NetEase `.ncm` files to mp3/flac
-with full tags, transcode existing audio between formats, import new music
-into a library folder with duplicate detection, and reorganize a library
-folder on disk. Comes as a CLI and a local web UI.
+with full tags, edit track metadata, transcode existing audio between formats,
+import new music into a library folder with duplicate detection, and
+reorganize a library folder on disk. Comes as a CLI and a local web UI.
 
 ## Usage
 
@@ -89,6 +89,21 @@ seven days and downloaded artwork for longer, so repeated album runs do not
 hit the services again. Writes happen through a same-directory temporary copy;
 the original path is replaced atomically only after the new tag has been read
 back and verified.
+
+## 歌曲信息（Web）
+
+The **歌曲信息** tab edits one track at a time. Enter an audio file or folder
+path (or leave it empty to use the configured library root), scan, then search
+the resulting list by filename, title, artist, album or album artist. The
+editor covers title, artist, album, album artist, year, genre, track number
+and disc number for MP3, FLAC and M4A.
+
+Only changed fields are written. Emptying a field removes that tag. Saves use
+the TrackMetadata size/mtime fingerprint from the scan: if the file changed in
+the meantime the write is refused rather than overwriting newer edits. Text
+edits preserve embedded artwork and never rename the file. Writes go through a
+same-directory temporary copy and are read back, checked for duration and
+unmodified-field changes, then atomically swapped in.
 
 ## import
 

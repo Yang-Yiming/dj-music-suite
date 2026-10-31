@@ -11,6 +11,7 @@ pub mod convert;
 pub mod cover;
 pub mod dedup;
 pub mod import;
+pub mod metadata;
 pub mod quality;
 pub mod reorg;
 pub mod scan;

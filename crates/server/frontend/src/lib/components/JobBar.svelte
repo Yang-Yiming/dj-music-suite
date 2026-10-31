@@ -12,6 +12,8 @@
     "dedup-execute": "正在移出重复文件",
     "transcode-analyze": "正在分析转码清单",
     "transcode-execute": "正在转换音频格式",
+    "metadata-scan": "正在扫描歌曲信息",
+    "metadata-write": "正在保存歌曲信息",
     "trash-restore": "正在放回文件",
     "trash-delete": "正在删除回收站文件",
   };

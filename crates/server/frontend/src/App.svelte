@@ -8,11 +8,12 @@
   import DedupPanel from "./lib/components/DedupPanel.svelte";
   import ImportPanel from "./lib/components/ImportPanel.svelte";
   import JobBar from "./lib/components/JobBar.svelte";
+  import MetadataPanel from "./lib/components/MetadataPanel.svelte";
   import ReorgPanel from "./lib/components/ReorgPanel.svelte";
   import SettingsModal from "./lib/components/SettingsModal.svelte";
   import TranscodePanel from "./lib/components/TranscodePanel.svelte";
 
-  type Tab = "convert" | "import" | "reorg" | "dedup" | "transcode" | "cover";
+  type Tab = "convert" | "import" | "reorg" | "dedup" | "transcode" | "cover" | "metadata";
 
   const TABS: { id: Tab; label: string }[] = [
     { id: "convert", label: "转换" },
@@ -21,6 +22,7 @@
     { id: "dedup", label: "去重" },
     { id: "transcode", label: "转码" },
     { id: "cover", label: "补封面" },
+    { id: "metadata", label: "歌曲信息" },
   ];
 
   let tab = $state<Tab>("convert");
@@ -64,6 +66,11 @@
     `mt-4 rounded-2xl border bg-white p-6 ${
       active ? "border-blue-300" : "border-slate-200"
     }`;
+
+  const mainClass = (active: Tab) =>
+    active === "metadata"
+      ? "mx-auto max-w-6xl px-4 pb-24"
+      : "mx-auto max-w-3xl px-4 pb-24";
 </script>
 
 <header class="mx-auto max-w-3xl px-4 pt-8 pb-2">
@@ -98,7 +105,7 @@
   </div>
 </header>
 
-<nav class="mx-auto mt-4 max-w-3xl px-4">
+<nav class="mx-auto mt-4 max-w-3xl overflow-x-auto px-4">
   <div class="inline-flex gap-1 rounded-xl bg-slate-200/70 p-1">
     {#each TABS as t (t.id)}
       <button class={tabButton(tab === t.id)} onclick={() => (tab = t.id)}>
@@ -108,7 +115,7 @@
   </div>
 </nav>
 
-<main class="mx-auto max-w-3xl px-4 pb-24">
+<main class={mainClass(tab)}>
   {#if tab === "convert"}
     <section class={cardClass(true)}>
       <h2 class="font-semibold">转换 NCM</h2>
@@ -142,6 +149,11 @@
     <section class={cardClass(true)}>
       <h2 class="font-semibold">补专辑封面</h2>
       <CoverPanel {libraryRoot} onNeedSettings={() => (settingsOpen = true)} />
+    </section>
+  {:else if tab === "metadata"}
+    <section class={cardClass(true)}>
+      <h2 class="font-semibold">编辑歌曲信息</h2>
+      <MetadataPanel {libraryRoot} onNeedSettings={() => (settingsOpen = true)} />
     </section>
   {/if}
 </main>
